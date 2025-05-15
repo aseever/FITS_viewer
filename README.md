@@ -1,1 +1,13 @@
 # FITS_viewer
+
+bash# Create and save a visualization with automatic settings
+python fits_viewer.py -i my_jwst_image.fits -o pretty_image.png
+
+# View detailed information about a FITS file
+python fits_viewer.py -i my_jwst_image.fits --info
+
+# Display the image interactively
+python fits_viewer.py -i my_jwst_image.fits --show
+
+# Customize the visualization
+python fits_viewer.py -i my_jwst_image.fits -o custom.png --colormap inferno --stretch asinh -
