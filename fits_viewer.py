@@ -10,6 +10,7 @@ Example usage:
     python fits_viewer.py -i my_jwst_image.fits -o pretty_image.png
     python fits_viewer.py -i my_jwst_image.fits --ext 1 --colormap inferno --stretch asinh
     python fits_viewer.py -i my_jwst_image.fits --show --scale log
+    python fits_viewer.py -i my_jwst_image.fits --debug --clip 99 --invert
 """
 
 import os
@@ -26,6 +27,7 @@ from astropy.wcs import WCS
 from astropy.visualization import (SqrtStretch, LogStretch, AsinhStretch, 
                                   LinearStretch, ImageNormalize, ZScaleInterval,
                                   MinMaxInterval, AsymmetricPercentileInterval)
+from astropy.stats import sigma_clip
 
 # Suppress some common warnings
 warnings.filterwarnings('ignore', category=UserWarning, append=True)
@@ -95,7 +97,7 @@ def identify_fits_type(hdul):
     for i, hdu in enumerate(hdul):
         ext_info = {
             'index': i,
-            'name': hdu.name if hasattr(hdu, 'name') else f"Extension {i}",
+            'name': hdu.name if hasattr(hdu, 'name') and hdu.name else f"Extension {i}",
             'type': hdu.__class__.__name__,
             'shape': None,
             'has_wcs': False
@@ -176,7 +178,7 @@ def get_optimal_stretch(data):
         return 'asinh'
     
     # If the data range is very large, use log
-    if data_range / np.nanmedian(np.abs(data)) > 1000:
+    if data_range / np.nanmedian(np.abs(data) + 1e-10) > 1000:
         return 'log'
     
     # If the data has many faint features, use sqrt
@@ -241,7 +243,95 @@ def get_colormap(fits_info, colormap=None):
     # Default colormap
     return 'viridis'
 
-def create_image(hdul, ext=None, stretch='auto', colormap=None, scale='linear', show_colorbar=True):
+def preprocess_data(data, clip_percent=None, sigma=None, invert=False, flip_x=False, flip_y=False, debug=False):
+    """
+    Preprocess the image data for better visualization
+    
+    Parameters:
+    -----------
+    data : numpy.ndarray
+        The image data
+    clip_percent : float or None
+        Percentile for clipping outliers (None for no clipping)
+    sigma : float or None
+        Sigma factor for sigma clipping (None for no sigma clipping)
+    invert : bool
+        Whether to invert the image (negative)
+    flip_x : bool
+        Whether to flip the image horizontally
+    flip_y : bool
+        Whether to flip the image vertically
+    debug : bool
+        Whether to print debug information
+        
+    Returns:
+    --------
+    numpy.ndarray : Preprocessed data
+    """
+    # Make a copy to avoid modifying the original
+    processed = np.copy(data)
+    
+    # Print basic statistics
+    if debug:
+        print("\n=== Data Statistics ===")
+        print(f"Shape: {data.shape}")
+        print(f"Data type: {data.dtype}")
+        print(f"Min: {np.nanmin(data)}")
+        print(f"Max: {np.nanmax(data)}")
+        print(f"Mean: {np.nanmean(data)}")
+        print(f"Median: {np.nanmedian(data)}")
+        print(f"Standard deviation: {np.nanstd(data)}")
+        print(f"NaN count: {np.sum(np.isnan(data))}")
+        print(f"Inf count: {np.sum(np.isinf(data))}")
+        print(f"Zero count: {np.sum(data == 0)}")
+        print(f"Negative count: {np.sum(data < 0)}")
+    
+    # Replace NaNs and Infs with zeros
+    processed = np.nan_to_num(processed, nan=0.0, posinf=np.nanmax(processed), neginf=np.nanmin(processed))
+    
+    # Apply sigma clipping if requested
+    if sigma is not None:
+        # Sigma clip outliers
+        clipped_data = sigma_clip(processed, sigma=sigma)
+        if debug:
+            print(f"Sigma clipping at {sigma}σ removed {np.sum(clipped_data.mask)} pixels")
+        
+        # Replace outliers with clipped values
+        processed = clipped_data.filled(fill_value=np.nanmedian(processed))
+    
+    # Apply percentile clipping if requested
+    if clip_percent is not None:
+        vmin = np.percentile(processed, 100 - clip_percent)
+        vmax = np.percentile(processed, clip_percent)
+        if debug:
+            print(f"Percentile clipping at {100-clip_percent}% - {clip_percent}%: [{vmin}, {vmax}]")
+        
+        processed = np.clip(processed, vmin, vmax)
+    
+    # Apply transformations
+    if invert:
+        if debug:
+            print("Inverting image")
+        # Invert the image (negative)
+        max_val = np.nanmax(processed)
+        min_val = np.nanmin(processed)
+        processed = max_val + min_val - processed
+    
+    if flip_y:
+        if debug:
+            print("Flipping image vertically")
+        processed = np.flipud(processed)
+    
+    if flip_x:
+        if debug:
+            print("Flipping image horizontally")
+        processed = np.fliplr(processed)
+    
+    return processed
+
+def create_image(hdul, ext=None, stretch='auto', colormap=None, scale='linear', 
+                clip_percent=None, sigma=None, invert=False, flip_x=False, flip_y=False,
+                show_colorbar=True, debug=False):
     """
     Create a visualization of the FITS data
     
@@ -257,8 +347,20 @@ def create_image(hdul, ext=None, stretch='auto', colormap=None, scale='linear', 
         Matplotlib colormap to use (None for auto)
     scale : str
         Scaling method ('linear', 'log', 'sqrt', 'power')
+    clip_percent : float or None
+        Percentile for clipping outliers (None for no clipping)
+    sigma : float or None
+        Sigma factor for sigma clipping (None for no sigma clipping)
+    invert : bool
+        Whether to invert the image (negative)
+    flip_x : bool
+        Whether to flip the image horizontally
+    flip_y : bool
+        Whether to flip the image vertically
     show_colorbar : bool
         Whether to show a colorbar
+    debug : bool
+        Whether to print debug information
         
     Returns:
     --------
@@ -267,24 +369,56 @@ def create_image(hdul, ext=None, stretch='auto', colormap=None, scale='linear', 
     # Get FITS information
     fits_info = identify_fits_type(hdul)
     
+    if debug:
+        print_fits_info(fits_info)
+    
     # Determine which extension to use
     if ext is None:
         ext = get_best_image_extension(fits_info)
         if ext is None:
-            raise ValueError("No suitable image extension found in this FITS file")
+            # Try using the primary HDU as a fallback
+            if hasattr(hdul[0], 'data') and hdul[0].data is not None:
+                ext = 0
+                print("No suitable image extension found - using primary HDU")
+            else:
+                raise ValueError("No suitable image extension found in this FITS file")
+    
+    if debug:
+        print(f"Using extension: {ext}")
     
     # Get the data
     data = hdul[ext].data
     header = hdul[ext].header
     
+    if debug and data is None:
+        print(f"WARNING: No data found in extension {ext}")
+        # Try to find another extension with data
+        for i, hdu in enumerate(hdul):
+            if hasattr(hdu, 'data') and hdu.data is not None:
+                print(f"Found data in extension {i} - using that instead")
+                data = hdu.data
+                header = hdu.header
+                ext = i
+                break
+    
     # Check if we need to extract a single 2D image from a higher-dimensional array
     if len(data.shape) > 2:
+        if debug:
+            print(f"Data has {len(data.shape)} dimensions: {data.shape}")
         # For JWST data cubes, usually the first slice is a good choice
         data = data[0] if data.shape[0] <= 10 else data[data.shape[0]//2]
-        print(f"Note: Extracted 2D slice from {len(hdul[ext].data.shape)}D data cube")
+        print(f"Extracted 2D slice from {len(hdul[ext].data.shape)}D data cube")
     
-    # Replace NaNs with zeros
-    data = np.nan_to_num(data, nan=0.0)
+    # Preprocess the data
+    data = preprocess_data(
+        data, 
+        clip_percent=clip_percent, 
+        sigma=sigma, 
+        invert=invert, 
+        flip_x=flip_x, 
+        flip_y=flip_y,
+        debug=debug
+    )
     
     # Determine stretch if auto
     if stretch == 'auto':
@@ -295,27 +429,36 @@ def create_image(hdul, ext=None, stretch='auto', colormap=None, scale='linear', 
     cmap = get_colormap(fits_info, colormap)
     print(f"Using colormap: {cmap}")
     
-    # Create the figure and axis
+    # Create the figure
     plt.figure(figsize=DEFAULT_FIGSIZE, dpi=DEFAULT_DPI)
     
     # Apply scaling
     if scale == 'log' and np.min(data) <= 0:
         # Handle zero/negative values in log scale
-        data_min = np.min(data[data > 0]) / 2
+        data_min = np.min(data[data > 0]) / 2 if np.any(data > 0) else 0.01
         data = np.maximum(data, data_min)
+        if debug:
+            print(f"Adjusted minimum value to {data_min} for log scaling")
     
     # Apply the scaling and stretch
     if scale == 'log':
-        norm = LogNorm(vmin=np.min(data), vmax=np.max(data))
+        vmin = np.min(data)
+        vmax = np.max(data)
+        if debug:
+            print(f"Using LogNorm with vmin={vmin}, vmax={vmax}")
+        norm = LogNorm(vmin=vmin, vmax=vmax)
     elif scale == 'sqrt':
+        if debug:
+            print("Using PowerNorm with gamma=0.5")
         norm = PowerNorm(gamma=0.5)
     elif scale == 'power':
+        if debug:
+            print("Using PowerNorm with gamma=2.0")
         norm = PowerNorm(gamma=2.0)
     else:  # 'linear'
+        if debug:
+            print(f"Using {stretch} stretch")
         norm = apply_stretch(data, stretch)
-    
-    # Create the plot
-    plt.figure(figsize=DEFAULT_FIGSIZE, dpi=DEFAULT_DPI)
     
     # Try to get WCS if available
     try:
@@ -323,10 +466,16 @@ def create_image(hdul, ext=None, stretch='auto', colormap=None, scale='linear', 
         if wcs.has_celestial:
             ax = plt.subplot(projection=wcs)
             plt.grid(color='white', ls='solid', alpha=0.3)
+            if debug:
+                print("Using WCS projection")
         else:
             ax = plt.subplot()
-    except:
+            if debug:
+                print("WCS has no celestial component")
+    except Exception as e:
         ax = plt.subplot()
+        if debug:
+            print(f"WCS error: {e}")
     
     # Display the image
     im = ax.imshow(data, origin='lower', norm=norm, cmap=cmap)
@@ -419,18 +568,30 @@ def main():
     # Required arguments
     parser.add_argument('-i', '--input', required=True, help="Input FITS file")
     
-    # Optional arguments
+    # Output options
     parser.add_argument('-o', '--output', help="Output image file (PNG, JPG, PDF)")
+    parser.add_argument('--dpi', type=int, default=DEFAULT_DPI, help=f"Resolution in dots per inch (default: {DEFAULT_DPI})")
+    parser.add_argument('--show', action='store_true', help="Display the image (in addition to saving)")
+    
+    # Data manipulation options
     parser.add_argument('-e', '--ext', type=int, help="FITS extension to use (default: auto-detect)")
+    parser.add_argument('--clip', type=float, help="Percentile for clipping outliers (e.g., 99.5)")
+    parser.add_argument('--sigma', type=float, help="Sigma clipping factor (e.g., 3.0)")
+    parser.add_argument('--invert', action='store_true', help="Invert the image (negative)")
+    parser.add_argument('--flip-x', action='store_true', help="Flip the image horizontally")
+    parser.add_argument('--flip-y', action='store_true', help="Flip the image vertically")
+    
+    # Visualization options
     parser.add_argument('-c', '--colormap', help="Matplotlib colormap to use (default: based on instrument)")
     parser.add_argument('-s', '--stretch', choices=['auto', 'linear', 'sqrt', 'log', 'asinh'], default='auto', 
                         help="Stretch method to apply (default: auto)")
     parser.add_argument('--scale', choices=['linear', 'log', 'sqrt', 'power'], default='linear',
                         help="Scaling method to apply (default: linear)")
-    parser.add_argument('--info', action='store_true', help="Print detailed information about the FITS file")
-    parser.add_argument('--show', action='store_true', help="Display the image (in addition to saving)")
     parser.add_argument('--no-colorbar', action='store_true', help="Don't display a colorbar")
-    parser.add_argument('--dpi', type=int, default=DEFAULT_DPI, help=f"Resolution in dots per inch (default: {DEFAULT_DPI})")
+    
+    # Debug options
+    parser.add_argument('--info', action='store_true', help="Print detailed information about the FITS file")
+    parser.add_argument('--debug', action='store_true', help="Print detailed debugging information")
     
     args = parser.parse_args()
     
@@ -449,7 +610,7 @@ def main():
         # Open the FITS file
         with fits.open(args.input) as hdul:
             # Print file info if requested
-            if args.info:
+            if args.info or args.debug:
                 fits_info = identify_fits_type(hdul)
                 print_fits_info(fits_info)
             
@@ -462,7 +623,13 @@ def main():
                     stretch=args.stretch,
                     colormap=args.colormap,
                     scale=args.scale,
-                    show_colorbar=not args.no_colorbar
+                    clip_percent=args.clip,
+                    sigma=args.sigma,
+                    invert=args.invert,
+                    flip_x=args.flip_x,
+                    flip_y=args.flip_y,
+                    show_colorbar=not args.no_colorbar,
+                    debug=args.debug
                 )
                 
                 # Save to file if requested
