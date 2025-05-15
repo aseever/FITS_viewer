@@ -1,21 +1,21 @@
-First download some fits files using https://github.com/aseever/MAST_Downloader
+1. First download some fits files using https://github.com/aseever/MAST_Downloader
 
-Put them in the /data directory
+2. Put them in the /data directory
 
-Use this tool to browse the file images to get a sense of what you have
+3. Use this tool to browse the file images to get a sense of what you have
 
- Create and save a visualization with automatic settings
+Create and save a visualization with automatic settings
  
-python fits_viewer.py -i my_jwst_image.fits -o pretty_image.png
+> python fits_viewer.py -i my_jwst_image.fits -o pretty_image.png
 
  View detailed information about a FITS file
  
-python fits_viewer.py -i my_jwst_image.fits --info
+> python fits_viewer.py -i my_jwst_image.fits --info
 
  Display the image interactively
  
-python fits_viewer.py -i my_jwst_image.fits --show
+> python fits_viewer.py -i my_jwst_image.fits --show
 
  Customize the visualization
  
-python fits_viewer.py -i my_jwst_image.fits -o custom.png --colormap inferno --stretch asinh -
+> python fits_viewer.py -i my_jwst_image.fits -o custom.png --colormap inferno --stretch asinh -
