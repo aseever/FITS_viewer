@@ -1,6 +1,7 @@
 # FITS_viewer
 
-bash# Create and save a visualization with automatic settings
+
+# Create and save a visualization with automatic settings
 python fits_viewer.py -i my_jwst_image.fits -o pretty_image.png
 
 # View detailed information about a FITS file
