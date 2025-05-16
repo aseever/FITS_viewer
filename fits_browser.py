@@ -18,7 +18,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')  # Must be before importing pyplot
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -29,6 +29,9 @@ from astropy.visualization import (SqrtStretch, LogStretch, AsinhStretch,
                                   MinMaxInterval, AsymmetricPercentileInterval)
 from astropy.wcs import WCS
 import warnings
+
+# Import UI components
+import ui_components
 
 # Import functionality from fits_viewer.py if available, otherwise define necessary functions
 try:
@@ -170,6 +173,78 @@ except ImportError:
         
         return processed
 
+# Create minimal fallback functions for object labeling
+def minimal_query_bright_stars(wcs, header, max_stars=25, magnitude_limit=12.0):
+    """Minimal fallback implementation to query for bright stars"""
+    print(f"Using minimal bright star query (mag limit: {magnitude_limit})")
+    try:
+        from astroquery.vizier import Vizier
+        import astropy.units as u
+        from astropy.coordinates import SkyCoord
+        
+        # Get image dimensions
+        ny, nx = header.get('NAXIS2', 1000), header.get('NAXIS1', 1000)
+        
+        # Get center coordinates
+        center = wcs.pixel_to_world(nx/2, ny/2)
+        
+        # Calculate approximate field radius (using corners)
+        corners = []
+        for x, y in [(0, 0), (nx, 0), (nx, ny), (0, ny)]:
+            try:
+                corner = wcs.pixel_to_world(x, y)
+                corners.append(corner)
+            except:
+                pass
+        
+        radius = max([center.separation(corner).deg for corner in corners]) if corners else 0.5
+        
+        # Query Vizier for bright stars
+        v = Vizier(column_filters={"Vmag": f"<{magnitude_limit}"}, row_limit=max_stars*3)
+        
+        # Try Hipparcos catalog
+        result = v.query_region(center, radius=radius*u.deg, catalog="I/239/hip_main")
+        
+        # Process results
+        stars = []
+        if result:
+            table = result[0]
+            for row in table:
+                try:
+                    ra = row['_RAJ2000']
+                    dec = row['_DEJ2000']
+                    coord = SkyCoord(ra=ra, dec=dec, unit='deg')
+                    x, y = wcs.world_to_pixel(coord)
+                    
+                    # Skip if outside image
+                    if x < 0 or x >= nx or y < 0 or y >= ny:
+                        continue
+                    
+                    # Get magnitude and name
+                    mag = row['Vmag'] if 'Vmag' in row.colnames else 999
+                    name = f"HIP {row['HIP']}" if 'HIP' in row.colnames else f"Star {len(stars)+1}"
+                    
+                    stars.append({
+                        'name': name,
+                        'ra': ra,
+                        'dec': dec,
+                        'x': x,
+                        'y': y,
+                        'mag': mag,
+                        'type': 'star'
+                    })
+                except Exception as e:
+                    print(f"Error processing star: {e}")
+            
+            # Sort by magnitude
+            stars.sort(key=lambda x: x.get('mag', 999))
+        
+        return stars[:max_stars]
+        
+    except Exception as e:
+        print(f"Error in minimal star query: {e}")
+        return []
+
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning, append=True)
 warnings.filterwarnings('ignore', category=RuntimeWarning, append=True)
@@ -197,6 +272,8 @@ class FitsBrowser(tk.Tk):
         self.current_file = None
         self.hdul = None
         self.current_ext = 0
+        self.object_labels_active = False
+        self.object_label_elements = []
         
         # Settings
         self.settings = {
@@ -207,7 +284,10 @@ class FitsBrowser(tk.Tk):
             'invert': False,
             'show_colorbar': True,
             'show_grid': True,
-            'zoom_level': 1.0
+            'zoom_level': 1.0,
+            'mag_limit': 12.0,  # Default magnitude limit for star queries
+            'max_stars': 25,    # Maximum number of stars to label
+            'max_deep_sky': 10  # Maximum number of deep sky objects to label
         }
         
         # Set up the layout
@@ -244,187 +324,123 @@ class FitsBrowser(tk.Tk):
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         
     def setup_file_browser(self):
-        """Set up the file browser panel"""
-        # Directory selection
-        dir_frame = ttk.Frame(self.file_frame)
-        dir_frame.pack(fill=tk.X, padx=5, pady=5)
+        """Set up the file browser panel using UI components"""
+        # Create callbacks
+        callbacks = {
+            'browse_directory': self.browse_directory,
+            'refresh_file_list': self.refresh_file_list,
+            'apply_filter': self.apply_filter,
+            'on_file_select': self.on_file_select
+        }
         
-        ttk.Label(dir_frame, text="Directory:").pack(side=tk.LEFT)
-        self.dir_entry = ttk.Entry(dir_frame)
-        self.dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.dir_entry.insert(0, self.data_dir)
+        # Create file browser components
+        components = ui_components.create_file_browser(
+            self.file_frame,
+            callbacks,
+            initial_dir=self.data_dir
+        )
         
-        browse_btn = ttk.Button(dir_frame, text="...", width=3, command=self.browse_directory)
-        browse_btn.pack(side=tk.LEFT)
-        
-        # File list
-        list_frame = ttk.LabelFrame(self.file_frame, text="FITS Files")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Scrollbars
-        y_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)
-        y_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # File listbox
-        self.file_listbox = tk.Listbox(list_frame, yscrollcommand=y_scrollbar.set)
-        self.file_listbox.pack(fill=tk.BOTH, expand=True)
-        y_scrollbar.config(command=self.file_listbox.yview)
-        
-        # Bind selection event
-        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
-        
-        # Refresh button
-        refresh_btn = ttk.Button(self.file_frame, text="Refresh", command=self.refresh_file_list)
-        refresh_btn.pack(pady=5)
-        
-        # File filter entry
-        filter_frame = ttk.Frame(self.file_frame)
-        filter_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(filter_frame, text="Filter:").pack(side=tk.LEFT)
-        self.filter_entry = ttk.Entry(filter_frame)
-        self.filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.filter_entry.bind("<Return>", lambda e: self.apply_filter())
-        
-        filter_btn = ttk.Button(filter_frame, text="Apply", command=self.apply_filter)
-        filter_btn.pack(side=tk.LEFT)
+        # Store references to components
+        self.dir_entry = components['dir_entry']
+        self.file_listbox = components['file_listbox']
+        self.filter_entry = components['filter_entry']
         
     def setup_image_display(self):
-        """Set up the image display panel"""
-        # Create figure for matplotlib
-        self.fig = Figure(figsize=(6, 6), dpi=100)
-        self.ax = self.fig.add_subplot(111)
+        """Set up the image display panel using UI components"""
+        # Create callbacks
+        callbacks = {
+            'prev_file': self.prev_file,
+            'next_file': self.next_file
+        }
         
-        # Canvas for matplotlib figure
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.image_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # Create image display components
+        components = ui_components.create_image_display(
+            self.image_frame,
+            callbacks
+        )
         
-        # Navigation toolbar
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self.image_frame)
-        self.toolbar.update()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Navigation buttons
-        nav_frame = ttk.Frame(self.image_frame)
-        nav_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        prev_btn = ttk.Button(nav_frame, text="← Previous", command=self.prev_file)
-        prev_btn.pack(side=tk.LEFT, padx=5)
-        
-        next_btn = ttk.Button(nav_frame, text="Next →", command=self.next_file)
-        next_btn.pack(side=tk.RIGHT, padx=5)
-        
-        # File info
-        self.info_label = ttk.Label(self.image_frame, text="No file selected", anchor=tk.CENTER)
-        self.info_label.pack(fill=tk.X, padx=5, pady=5)
-        
+        # Store references to components
+        self.fig = components['fig']
+        self.ax = components['ax']
+        self.canvas = components['canvas']
+        self.toolbar = components['toolbar']
+        self.info_label = components['info_label']
+    
     def setup_controls(self):
-        """Set up the control panel"""
-        # Extensions frame
-        ext_frame = ttk.LabelFrame(self.control_frame, text="Extensions")
-        ext_frame.pack(fill=tk.X, padx=5, pady=5)
+        """Set up the control panel using UI components"""
+        # Create extensions selector
+        ext_components = ui_components.create_extension_selector(
+            self.control_frame,
+            self.on_extension_change
+        )
         
-        self.ext_var = tk.StringVar(value="Auto")
-        self.ext_combobox = ttk.Combobox(ext_frame, textvariable=self.ext_var, state="readonly")
-        self.ext_combobox.pack(fill=tk.X, padx=5, pady=5)
-        self.ext_combobox.bind("<<ComboboxSelected>>", self.on_extension_change)
+        # Store references to components
+        self.ext_var = ext_components['ext_var']
+        self.ext_combobox = ext_components['ext_combobox']
         
-        # Visualization frame
-        viz_frame = ttk.LabelFrame(self.control_frame, text="Visualization")
-        viz_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Create visualization controls
+        viz_callbacks = {
+            'on_settings_change': self.on_settings_change,
+            'on_clip_change': self.on_clip_change,
+            'apply_settings': self.apply_settings
+        }
         
-        # Colormap
-        ttk.Label(viz_frame, text="Colormap:").pack(anchor=tk.W, padx=5, pady=2)
+        viz_components = ui_components.create_visualization_controls(
+            self.control_frame,
+            viz_callbacks,
+            self.settings
+        )
         
-        self.colormap_var = tk.StringVar(value=self.settings['colormap'])
-        colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 
-                    'gray', 'hot', 'cool', 'rainbow', 'jet', 'turbo']
-        self.colormap_combobox = ttk.Combobox(viz_frame, textvariable=self.colormap_var, 
-                                             values=colormaps, state="readonly")
-        self.colormap_combobox.pack(fill=tk.X, padx=5, pady=2)
-        self.colormap_combobox.bind("<<ComboboxSelected>>", self.on_settings_change)
+        # Store references to components
+        self.colormap_var = viz_components['colormap_var']
+        self.stretch_var = viz_components['stretch_var']
+        self.scale_var = viz_components['scale_var']
+        self.clip_var = viz_components['clip_var']
+        self.invert_var = viz_components['invert_var']
+        self.colorbar_var = viz_components['colorbar_var']
+        self.grid_var = viz_components['grid_var']
+        self.clip_label = viz_components['clip_label']
         
-        # Stretch
-        ttk.Label(viz_frame, text="Stretch:").pack(anchor=tk.W, padx=5, pady=2)
-        
-        self.stretch_var = tk.StringVar(value=self.settings['stretch'])
-        stretches = ['auto', 'linear', 'sqrt', 'log', 'asinh']
-        self.stretch_combobox = ttk.Combobox(viz_frame, textvariable=self.stretch_var, 
-                                            values=stretches, state="readonly")
-        self.stretch_combobox.pack(fill=tk.X, padx=5, pady=2)
-        self.stretch_combobox.bind("<<ComboboxSelected>>", self.on_settings_change)
-        
-        # Scale
-        ttk.Label(viz_frame, text="Scale:").pack(anchor=tk.W, padx=5, pady=2)
-        
-        self.scale_var = tk.StringVar(value=self.settings['scale'])
-        scales = ['linear', 'log', 'sqrt', 'power']
-        self.scale_combobox = ttk.Combobox(viz_frame, textvariable=self.scale_var, 
-                                          values=scales, state="readonly")
-        self.scale_combobox.pack(fill=tk.X, padx=5, pady=2)
-        self.scale_combobox.bind("<<ComboboxSelected>>", self.on_settings_change)
-        
-        # Clip percent
-        ttk.Label(viz_frame, text="Clip Percent:").pack(anchor=tk.W, padx=5, pady=2)
-        
-        clip_frame = ttk.Frame(viz_frame)
-        clip_frame.pack(fill=tk.X, padx=5, pady=2)
-        
-        self.clip_var = tk.DoubleVar(value=self.settings['clip_percent'])
-        self.clip_scale = ttk.Scale(clip_frame, from_=80, to=100, 
-                                  variable=self.clip_var, orient=tk.HORIZONTAL)
-        self.clip_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        self.clip_label = ttk.Label(clip_frame, text=f"{self.settings['clip_percent']:.1f}%", width=5)
-        self.clip_label.pack(side=tk.RIGHT)
-        
-        # Update clip label when scale changes
-        self.clip_var.trace_add("write", self.on_clip_change)
-        
-        # Invert
-        self.invert_var = tk.BooleanVar(value=self.settings['invert'])
-        invert_cb = ttk.Checkbutton(viz_frame, text="Invert", variable=self.invert_var,
-                                   command=self.on_settings_change)
-        invert_cb.pack(anchor=tk.W, padx=5, pady=2)
-        
-        # Colorbar
-        self.colorbar_var = tk.BooleanVar(value=self.settings['show_colorbar'])
-        colorbar_cb = ttk.Checkbutton(viz_frame, text="Show Colorbar", variable=self.colorbar_var,
-                                     command=self.on_settings_change)
-        colorbar_cb.pack(anchor=tk.W, padx=5, pady=2)
-        
-        # Grid
-        self.grid_var = tk.BooleanVar(value=self.settings['show_grid'])
-        grid_cb = ttk.Checkbutton(viz_frame, text="Show Grid", variable=self.grid_var,
-                                 command=self.on_settings_change)
-        grid_cb.pack(anchor=tk.W, padx=5, pady=2)
-        
-        # Apply button
-        apply_btn = ttk.Button(viz_frame, text="Apply", command=self.apply_settings)
-        apply_btn.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Processing frame
-        proc_frame = ttk.LabelFrame(self.control_frame, text="Image Processing")
-        proc_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Save button
-        save_btn = ttk.Button(proc_frame, text="Save Image", command=self.save_image)
-        save_btn.pack(fill=tk.X, padx=5, pady=5)
-        
-        # FITS Info
-        info_btn = ttk.Button(proc_frame, text="Show FITS Info", command=self.show_fits_info)
-        info_btn.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Sky Location button
+        # Check if sky_location.py is available
+        has_sky_location = False
         try:
             from sky_location import create_sky_location_dialog
-            sky_btn = ttk.Button(proc_frame, text="Show Sky Location", 
-                              command=lambda: self.show_sky_location())
-            sky_btn.pack(fill=tk.X, padx=5, pady=5)
+            has_sky_location = True
         except ImportError:
             print("sky_location.py not found - Sky Location button not added")
-            
+        
+        # Create processing controls
+        proc_callbacks = {
+            'save_image': self.save_image,
+            'show_fits_info': self.show_fits_info,
+            'show_sky_location': self.show_sky_location,
+            'show_object_labels': self.show_object_labels
+        }
+        
+        self.proc_frame = ui_components.create_processing_controls(
+            self.control_frame,
+            proc_callbacks,
+            has_sky_location
+        )
+        
+        # Create object labeling controls
+        obj_callbacks = {
+            'on_mag_change': self.on_mag_change,
+            'show_object_labels': self.show_object_labels,
+            'clear_object_labels': self.clear_object_labels
+        }
+        
+        obj_components = ui_components.create_object_labeling_controls(
+            self.control_frame,
+            obj_callbacks,
+            self.settings
+        )
+        
+        # Store references to components
+        self.mag_var = obj_components['mag_var']
+        self.max_stars_var = obj_components['max_stars_var']
+        self.mag_label = obj_components['mag_label']
+    
     def show_sky_location(self):
         """Show sky location of the current FITS file"""
         if not self.current_file:
@@ -440,6 +456,267 @@ class FitsBrowser(tk.Tk):
             messagebox.showerror("Error", "sky_location.py module not found")
         except Exception as e:
             messagebox.showerror("Error", f"Error showing sky location: {e}")
+    
+    def on_mag_change(self, *args):
+        """Handle magnitude limit change"""
+        value = self.mag_var.get()
+        self.mag_label['text'] = f"{value:.1f}"
+        self.settings['mag_limit'] = value
+    
+    def clear_object_labels(self):
+        """Clear all object labels from the current view"""
+        if not self.object_labels_active:
+            return
+            
+        # Remove all text and marker elements
+        for element in self.object_label_elements:
+            try:
+                element.remove()
+            except:
+                pass
+        
+        # Reset state
+        self.object_labels_active = False
+        self.object_label_elements = []
+        
+        # Redraw the canvas
+        self.canvas.draw()
+        self.status_bar['text'] = "Object labels cleared"
+    
+    def show_object_labels(self):
+        """Show celestial object labels on the current FITS file"""
+        if not self.current_file:
+            messagebox.showinfo("Info", "No file loaded")
+            return
+            
+        # Check if we have WCS information
+        wcs = None
+        try:
+            # Get WCS from the current extension
+            header = self.hdul[self.current_ext].header
+            wcs = WCS(header).celestial
+            if not wcs.has_celestial:
+                raise ValueError("No celestial WCS available")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not get WCS information: {e}")
+            return
+            
+        # Clear any existing labels
+        self.clear_object_labels()
+        
+        # Set parameters from settings
+        mag_limit = self.settings['mag_limit']
+        try:
+            max_stars = self.max_stars_var.get()
+        except:
+            max_stars = 25  # Default if widget not available
+            
+        max_deep_sky = self.settings.get('max_deep_sky', 10)
+        
+        # Update status
+        self.status_bar['text'] = f"Querying catalog data (mag limit: {mag_limit:.1f})..."
+        self.update_idletasks()
+        
+        # Use a thread to prevent UI freezing during catalog query
+        def add_labels_thread():
+            try:
+                # Initialize objects list
+                objects = []
+                
+                # Try to import catalog_query first (new dedicated module)
+                try:
+                    import catalog_query
+                    # Use the more robust catalog query function
+                    print("Using catalog_query module for star querying")
+                    stars = catalog_query.query_star_catalog(wcs, header, max_stars, mag_limit)
+                    objects = stars  # Use just the stars for now
+
+                # Fall back to object_labels if catalog_query not available
+                except ImportError:
+                    try:
+                        # Try to use object_labels if available
+                        from object_labels import query_bright_stars, query_deep_sky_objects
+                        print("Using object_labels module")
+                        
+                        # Query stars with our magnitude limit
+                        stars = query_bright_stars(wcs, header, max_stars=max_stars, magnitude_limit=mag_limit)
+                        # Query deep sky objects
+                        deep_sky = query_deep_sky_objects(wcs, header, max_objects=max_deep_sky)
+                        
+                        # Combine objects
+                        objects = stars + deep_sky
+                    
+                    except ImportError:
+                        # Direct astroquery fallback - simplified and focused on most reliable catalog
+                        print("Using direct astroquery fallback")
+                        try:
+                            from astroquery.vizier import Vizier
+                            import astropy.units as u
+                            
+                            # Get center coordinates
+                            ny, nx = header.get('NAXIS2', 1000), header.get('NAXIS1', 1000)
+                            center = wcs.pixel_to_world(nx/2, ny/2)
+                            print(f"Image center: RA={center.ra.deg:.3f}°, Dec={center.dec.deg:.3f}°")
+                            
+                            # Calculate field radius
+                            corners = []
+                            for x, y in [(0, 0), (nx, 0), (nx, ny), (0, ny)]:
+                                try:
+                                    corner = wcs.pixel_to_world(x, y)
+                                    corners.append(corner)
+                                except:
+                                    pass
+                            
+                            radius = max([center.separation(corner).deg for corner in corners]) if corners else 0.5
+                            print(f"Field radius: {radius:.3f}°")
+                            
+                            # Query the Yale Bright Star Catalog directly with NO column filters
+                            # This is often more reliable for initial testing
+                            v = Vizier(columns=['*', '+_r'])
+                            v.ROW_LIMIT = 100  # Get more stars
+                            
+                            result = v.query_region(center, radius=radius*u.deg, catalog="V/50")
+                            
+                            if result and len(result) > 0:
+                                table = result[0]
+                                print(f"Found {len(table)} objects in Yale Bright Star Catalog")
+                                print(f"Columns: {table.colnames}")
+                                
+                                # Process the results into our standard format
+                                for row in table:
+                                    try:
+                                        # Get coordinates from the Yale catalog, which should have consistent columns
+                                        ra = row['RAJ2000']  # Yale uses 'RAJ2000' not '_RAJ2000'
+                                        dec = row['DEJ2000']  # Yale uses 'DEJ2000' not '_DEJ2000'
+                                        
+                                        coord = SkyCoord(ra=ra, dec=dec, unit=(u.hourangle, u.deg))
+                                        x, y = wcs.world_to_pixel(coord)
+                                        
+                                        # Skip if outside image
+                                        if x < 0 or x >= nx or y < 0 or y >= ny:
+                                            continue
+                                        
+                                        # Get magnitude from Yale catalog (reliable)
+                                        mag = row['Vmag'] if 'Vmag' in row.colnames else 999
+                                        if mag > mag_limit:
+                                            continue
+                                        
+                                        # Star name from Yale catalog
+                                        name = f"HR {row['HR']}" if 'HR' in row.colnames else f"Star {len(objects)+1}"
+                                        
+                                        objects.append({
+                                            'name': name,
+                                            'ra': coord.ra.deg,
+                                            'dec': coord.dec.deg,
+                                            'x': x,
+                                            'y': y,
+                                            'mag': mag,
+                                            'type': 'star'
+                                        })
+                                    except Exception as e:
+                                        print(f"Error processing Yale star: {e}")
+                            else:
+                                print("No results from Yale catalog")
+                        
+                        except Exception as e:
+                            print(f"Error in direct catalog query: {e}")
+                
+                # We should have objects now, from one of the methods
+                print(f"Found {len(objects)} objects to label")
+                
+                # No objects found
+                if not objects:
+                    self.status_bar['text'] = f"No objects found (mag limit: {mag_limit:.1f})"
+                    return
+                
+                # Set up label colors
+                label_colors = {
+                    'star': 'yellow',
+                    'galaxy': 'cyan',
+                    'nebula': 'magenta',
+                    'cluster': 'green',
+                    'deep_sky': 'red',
+                    'other': 'white'
+                }
+                
+                # Create more visible text box properties
+                bbox_props = dict(
+                    boxstyle='round,pad=0.3',
+                    facecolor='black',
+                    alpha=0.6,
+                    edgecolor='none'
+                )
+                
+                # Add labels to the plot - try different methods in order
+                try:
+                    # Try catalog_query module first (if available)
+                    import catalog_query
+                    elements = catalog_query.add_object_labels(
+                        self.ax, objects, 
+                        fontsize=10, 
+                        marker=None,  # No markers
+                        marker_size=0,
+                        fontweight='bold',
+                        bbox_props=bbox_props
+                    )
+                    
+                except ImportError:
+                    try:
+                        # Try object_labels module if available
+                        from object_labels import add_object_labels
+                        elements = add_object_labels(
+                            self.ax, objects, 
+                            fontsize=10, 
+                            color='white',
+                            marker='o',
+                            show_marker=True,
+                            marker_size=12,
+                            only_show_brightest=False,
+                            label_colors=label_colors
+                        )
+                    except ImportError:
+                        # Fallback to built-in function
+                        elements = []
+                        for obj in objects:
+                            try:
+                                x, y = obj['x'], obj['y']
+                                name = obj['name']
+                                obj_type = obj.get('type', 'other')
+                                
+                                # Choose color based on object type
+                                color = label_colors.get(obj_type, 'white')
+                                
+                                # Add marker
+                                m = self.ax.plot(x, y, 'o', color=color, ms=12, mew=1.5, zorder=100)[0]
+                                elements.append(m)
+                                
+                                # Add text label
+                                t = self.ax.text(x + 15, y + 15, name, color=color, fontsize=10, fontweight='bold',
+                                             bbox=bbox_props, ha='left', va='center', zorder=101)
+                                elements.append(t)
+                                
+                            except Exception as e:
+                                print(f"Error adding label: {e}")
+                
+                # Store the elements
+                self.object_label_elements = elements
+                self.object_labels_active = True
+                
+                # Update status bar
+                self.status_bar['text'] = f"Added {len(objects)} object labels (mag limit: {mag_limit:.1f})"
+                
+                # Redraw the canvas
+                self.canvas.draw()
+                
+            except Exception as e:
+                # Update status with error
+                self.status_bar['text'] = f"Error adding labels: {str(e)[:100]}"
+                print(f"Error in label thread: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Start the thread
+        threading.Thread(target=add_labels_thread).start()
     
     def browse_directory(self):
         """Open directory browser dialog"""
@@ -521,6 +798,9 @@ class FitsBrowser(tk.Tk):
         if self.current_file_index >= len(self.files):
             self.current_file_index = -1
             return
+        
+        # Clear any existing object labels
+        self.clear_object_labels()
         
         # Load the selected file
         self.load_fits_file(self.files[self.current_file_index])
@@ -658,6 +938,10 @@ class FitsBrowser(tk.Tk):
             self.fig.tight_layout()
             self.canvas.draw()
             
+            # Reset object labels state
+            self.object_labels_active = False
+            self.object_label_elements = []
+            
         except Exception as e:
             messagebox.showerror("Error", f"Error displaying FITS file: {e}")
             self.status_bar['text'] = f"Error displaying FITS file: {str(e)[:100]}..."
@@ -672,6 +956,9 @@ class FitsBrowser(tk.Tk):
         else:
             # Extract extension index from the selection
             self.current_ext = int(selection.split(':')[0])
+        
+        # Clear any existing object labels
+        self.clear_object_labels()
         
         # Update display
         self.display_fits()
@@ -696,6 +983,10 @@ class FitsBrowser(tk.Tk):
         """Apply current settings to the display"""
         self.on_settings_change()
         if self.current_file:
+            # Clear any existing object labels
+            self.clear_object_labels()
+            
+            # Update display
             self.display_fits()
     
     def prev_file(self):
@@ -708,6 +999,11 @@ class FitsBrowser(tk.Tk):
             self.file_listbox.selection_clear(0, tk.END)
             self.file_listbox.selection_set(self.current_file_index)
             self.file_listbox.see(self.current_file_index)
+            
+            # Clear any existing object labels
+            self.clear_object_labels()
+            
+            # Load the new file
             self.load_fits_file(self.files[self.current_file_index])
     
     def next_file(self):
@@ -720,6 +1016,11 @@ class FitsBrowser(tk.Tk):
             self.file_listbox.selection_clear(0, tk.END)
             self.file_listbox.selection_set(self.current_file_index)
             self.file_listbox.see(self.current_file_index)
+            
+            # Clear any existing object labels
+            self.clear_object_labels()
+            
+            # Load the new file
             self.load_fits_file(self.files[self.current_file_index])
     
     def save_image(self):
@@ -756,63 +1057,14 @@ class FitsBrowser(tk.Tk):
         # Get FITS info
         fits_info = identify_fits_type(self.hdul)
         
-        # Create info dialog
-        info_dialog = tk.Toplevel(self)
-        info_dialog.title(f"FITS Info: {os.path.basename(self.current_file)}")
-        info_dialog.geometry("600x400")
-        info_dialog.minsize(400, 300)
-        
-        # Add text widget with scrollbar
-        frame = ttk.Frame(info_dialog)
-        frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        scroll = ttk.Scrollbar(frame)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        text = tk.Text(frame, wrap=tk.WORD, yscrollcommand=scroll.set)
-        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.config(command=text.yview)
-        
-        # Add FITS information
-        text.insert(tk.END, f"File: {self.current_file}\n\n")
-        
-        if fits_info.get('telescope'):
-            text.insert(tk.END, f"Telescope: {fits_info['telescope']}\n")
-        
-        if fits_info.get('instrument'):
-            text.insert(tk.END, f"Instrument: {fits_info['instrument']}\n")
-        
-        if fits_info.get('target'):
-            text.insert(tk.END, f"Target: {fits_info['target']}\n")
-        
-        if fits_info.get('filter'):
-            text.insert(tk.END, f"Filter: {fits_info['filter']}\n")
-        
-        text.insert(tk.END, f"\nNumber of extensions: {fits_info['n_extensions']}\n")
-        text.insert(tk.END, "Image extensions: " + 
-                  (', '.join(map(str, fits_info['image_extensions'])) if fits_info['image_extensions'] else "None") +
-                  "\n\n")
-        
-        text.insert(tk.END, "Extension details:\n")
-        for ext in fits_info['extensions']:
-            text.insert(tk.END, f"  [{ext['index']}] {ext['name']} - Type: {ext['type']}\n")
-            if ext.get('shape'):
-                text.insert(tk.END, f"      Shape: {ext['shape']}\n")
-            text.insert(tk.END, f"      WCS: {'Yes' if ext.get('has_wcs') else 'No'}\n")
-        
-        text.insert(tk.END, f"\nCurrent extension: {self.current_ext}\n")
-        
-        # Add current display settings
-        text.insert(tk.END, "\nCurrent Display Settings:\n")
-        for key, value in self.settings.items():
-            text.insert(tk.END, f"  {key}: {value}\n")
-        
-        # Make text widget read-only
-        text.config(state=tk.DISABLED)
-        
-        # Add close button
-        close_btn = ttk.Button(info_dialog, text="Close", command=info_dialog.destroy)
-        close_btn.pack(pady=5)
+        # Use UI component to create the dialog
+        ui_components.create_fits_info_dialog(
+            self, 
+            fits_info, 
+            self.current_file, 
+            self.current_ext, 
+            self.settings
+        )
 
 def main():
     """Main function"""
