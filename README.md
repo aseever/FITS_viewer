@@ -1,5 +1,5 @@
 
-A simple, lightweight fits file browser
+A lightweight fits file browser
 
 ![image](https://github.com/aseever/FITS_viewer/blob/main/tool_sample.png)
 
