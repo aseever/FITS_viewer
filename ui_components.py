@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-ui_components.py - UI components for the FITS browser application
-
-This module contains reusable UI components for the FITS browser application.
-It separates the UI code from the business logic to make the codebase more maintainable.
-"""
-
 import tkinter as tk
 from tkinter import ttk
 import matplotlib
@@ -257,118 +249,6 @@ def create_visualization_controls(parent, callbacks, settings):
         'clip_label': clip_label
     }
 
-def create_processing_controls(parent, callbacks, has_sky_location=False):
-    """
-    Create the image processing controls panel
-    
-    Parameters:
-    -----------
-    parent : tk.Frame
-        Parent frame for the processing controls
-    callbacks : dict
-        Dictionary of callback functions:
-        - save_image: Function to call when save button is clicked
-        - show_fits_info: Function to call when info button is clicked
-        - show_sky_location: Function to call when sky location button is clicked
-        - show_object_labels: Function to call when object labels button is clicked
-    has_sky_location : bool
-        Whether the sky location module is available
-        
-    Returns:
-    --------
-    ttk.LabelFrame : The processing frame
-    """
-    # Create processing frame
-    proc_frame = ttk.LabelFrame(parent, text="Image Processing")
-    proc_frame.pack(fill=tk.X, padx=5, pady=5)
-    
-    # Save button
-    save_btn = ttk.Button(proc_frame, text="Save Image", command=callbacks['save_image'])
-    save_btn.pack(fill=tk.X, padx=5, pady=5)
-    
-    # FITS Info
-    info_btn = ttk.Button(proc_frame, text="Show FITS Info", command=callbacks['show_fits_info'])
-    info_btn.pack(fill=tk.X, padx=5, pady=5)
-    
-    # Sky Location button
-    if has_sky_location:
-        sky_btn = ttk.Button(proc_frame, text="Show Sky Location", 
-                          command=callbacks['show_sky_location'])
-        sky_btn.pack(fill=tk.X, padx=5, pady=5)
-    
-    # Add Object Labels button
-    obj_btn = ttk.Button(proc_frame, text="Label Celestial Objects", 
-                     command=callbacks['show_object_labels'])
-    obj_btn.pack(fill=tk.X, padx=5, pady=5)
-    
-    return proc_frame
-
-def create_object_labeling_controls(parent, callbacks, settings):
-    """
-    Create the object labeling controls panel
-    
-    Parameters:
-    -----------
-    parent : tk.Frame
-        Parent frame for the object labeling controls
-    callbacks : dict
-        Dictionary of callback functions:
-        - on_mag_change: Function to call when magnitude limit is changed
-        - show_object_labels: Function to call when apply button is clicked
-        - clear_object_labels: Function to call when clear button is clicked
-    settings : dict
-        Dictionary of initial settings
-        
-    Returns:
-    --------
-    dict : Dictionary containing UI elements and variables:
-        - mag_var: Magnitude limit variable
-        - max_stars_var: Maximum stars variable
-        - mag_label: Magnitude limit label
-    """
-    # Create object labeling frame
-    obj_frame = ttk.LabelFrame(parent, text="Object Labeling Controls")
-    obj_frame.pack(fill=tk.X, padx=5, pady=5)
-    
-    # Magnitude limit
-    ttk.Label(obj_frame, text="Magnitude Limit:").pack(anchor=tk.W, padx=5, pady=2)
-    
-    mag_frame = ttk.Frame(obj_frame)
-    mag_frame.pack(fill=tk.X, padx=5, pady=2)
-    
-    mag_var = tk.DoubleVar(value=settings['mag_limit'])
-    mag_scale = ttk.Scale(mag_frame, from_=6.0, to=16.0, 
-                          variable=mag_var, orient=tk.HORIZONTAL)
-    mag_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    
-    mag_label = ttk.Label(mag_frame, text=f"{settings['mag_limit']:.1f}", width=5)
-    mag_label.pack(side=tk.RIGHT)
-    
-    # Update magnitude label when scale changes
-    mag_var.trace_add("write", callbacks['on_mag_change'])
-    
-    # Max stars
-    ttk.Label(obj_frame, text="Max Stars:").pack(anchor=tk.W, padx=5, pady=2)
-    max_stars_var = tk.IntVar(value=settings['max_stars'])
-    max_stars_spin = ttk.Spinbox(obj_frame, from_=5, to=100, textvariable=max_stars_var, width=5)
-    max_stars_spin.pack(fill=tk.X, padx=5, pady=2)
-    
-    # Apply button (duplicated for convenience)
-    apply_obj_btn = ttk.Button(obj_frame, text="Apply Object Labels", 
-                            command=callbacks['show_object_labels'])
-    apply_obj_btn.pack(fill=tk.X, padx=5, pady=5)
-    
-    # Clear Labels button
-    clear_obj_btn = ttk.Button(obj_frame, text="Clear Object Labels", 
-                            command=callbacks['clear_object_labels'])
-    clear_obj_btn.pack(fill=tk.X, padx=5, pady=5)
-    
-    return {
-        'mag_var': mag_var,
-        'max_stars_var': max_stars_var,
-        'mag_label': mag_label
-    }
-
 def create_extension_selector(parent, callback):
     """
     Create the extension selector panel
@@ -400,6 +280,60 @@ def create_extension_selector(parent, callback):
         'ext_combobox': ext_combobox,
         'frame': ext_frame
     }
+
+def create_processing_controls(parent, callbacks, has_sky_location=False, has_toggle_labels=False):
+    """
+    Create the image processing controls panel
+    
+    Parameters:
+    -----------
+    parent : tk.Frame
+        Parent frame for the processing controls
+    callbacks : dict
+        Dictionary of callback functions:
+        - save_image: Function to call when save button is clicked
+        - show_fits_info: Function to call when info button is clicked
+        - show_sky_location: Function to call when sky location button is clicked
+        - toggle_object_labels: Function to call when object labels button is clicked
+    has_sky_location : bool
+        Whether the sky location module is available
+    has_toggle_labels : bool
+        Whether to use toggle button for object labels
+        
+    Returns:
+    --------
+    ttk.LabelFrame : The processing frame
+    """
+    # Create processing frame
+    proc_frame = ttk.LabelFrame(parent, text="Image Processing")
+    proc_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+    # Save button
+    save_btn = ttk.Button(proc_frame, text="Save Image", command=callbacks['save_image'])
+    save_btn.pack(fill=tk.X, padx=5, pady=5)
+    
+    # FITS Info
+    info_btn = ttk.Button(proc_frame, text="Show FITS Info", command=callbacks['show_fits_info'])
+    info_btn.pack(fill=tk.X, padx=5, pady=5)
+    
+    # Sky Location button
+    if has_sky_location:
+        sky_btn = ttk.Button(proc_frame, text="Show Sky Location", 
+                          command=callbacks['show_sky_location'])
+        sky_btn.pack(fill=tk.X, padx=5, pady=5)
+    
+    # Object Labels button as a toggle
+    if has_toggle_labels:
+        label_btn = ttk.Button(proc_frame, text="Toggle Celestial Labels", 
+                             command=callbacks['toggle_object_labels'])
+        label_btn.pack(fill=tk.X, padx=5, pady=5)
+    else:
+        # Original behavior - separate buttons
+        label_btn = ttk.Button(proc_frame, text="Label Celestial Objects", 
+                             command=callbacks['show_object_labels'])
+        label_btn.pack(fill=tk.X, padx=5, pady=5)
+    
+    return proc_frame
 
 def create_fits_info_dialog(parent, fits_info, current_file, current_ext, settings):
     """

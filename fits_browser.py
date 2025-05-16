@@ -3,8 +3,8 @@
 fits_browser.py - Lightweight GUI for browsing and visualizing FITS files
 
 This application provides a graphical interface for navigating through directories of
-FITS files and visualizing them using the same high-quality visualization techniques
-from fits_viewer.py.
+FITS files and visualizing them using high-quality visualization techniques.
+It now uses a curated database of celestial objects for labeling.
 
 Usage:
     python fits_browser.py [data_directory]
@@ -32,6 +32,15 @@ import warnings
 
 # Import UI components
 import ui_components
+
+# Import the curated objects module (replaces catalog_query)
+try:
+    from curated_objects import find_objects_in_field, add_object_labels
+    print("Successfully imported functions from curated_objects.py")
+    HAVE_CURATED_OBJECTS = True
+except ImportError:
+    print("Could not import curated_objects.py; object labeling will be limited")
+    HAVE_CURATED_OBJECTS = False
 
 # Import functionality from fits_viewer.py if available, otherwise define necessary functions
 try:
@@ -173,77 +182,97 @@ except ImportError:
         
         return processed
 
-# Create minimal fallback functions for object labeling
-def minimal_query_bright_stars(wcs, header, max_stars=25, magnitude_limit=12.0):
-    """Minimal fallback implementation to query for bright stars"""
-    print(f"Using minimal bright star query (mag limit: {magnitude_limit})")
-    try:
-        from astroquery.vizier import Vizier
-        import astropy.units as u
-        from astropy.coordinates import SkyCoord
-        
-        # Get image dimensions
+# Fall back for object labeling if curated_objects is not available
+if not HAVE_CURATED_OBJECTS:
+    def find_objects_in_field(wcs, header, max_objects=25, magnitude_limit=12.0):
+        """Fallback implementation to generate generic stars"""
+        print("Using fallback object generation")
         ny, nx = header.get('NAXIS2', 1000), header.get('NAXIS1', 1000)
-        
-        # Get center coordinates
         center = wcs.pixel_to_world(nx/2, ny/2)
         
-        # Calculate approximate field radius (using corners)
-        corners = []
-        for x, y in [(0, 0), (nx, 0), (nx, ny), (0, ny)]:
+        # Get target from header if available
+        target_name = None
+        for key in ['OBJECT', 'TARGNAME', 'TARGET']:
+            if key in header and header[key] and str(header[key]).strip():
+                target_name = str(header[key]).strip()
+                print(f"Target from header: {target_name}")
+                break
+        
+        # Create generic star objects
+        objects = []
+        
+        # Add center point (possibly as target)
+        name = target_name if target_name else "Central Object"
+        objects.append({
+            'name': name,
+            'ra': center.ra.deg,
+            'dec': center.dec.deg,
+            'x': nx/2,
+            'y': ny/2,
+            'mag': 8.0,
+            'type': 'star',
+            'importance': 'high'
+        })
+        
+        # Add a few more at standard positions
+        positions = [
+            (0.25, 0.25, "Star 1"),
+            (0.75, 0.25, "Star 2"),
+            (0.25, 0.75, "Star 3"),
+            (0.75, 0.75, "Star 4"),
+            (0.5, 0.3, "Star 5"),
+            (0.3, 0.5, "Star 6"),
+            (0.7, 0.5, "Star 7"),
+            (0.5, 0.7, "Star 8")
+        ]
+        
+        for rx, ry, name in positions:
+            x, y = int(rx * nx), int(ry * ny)
             try:
-                corner = wcs.pixel_to_world(x, y)
-                corners.append(corner)
+                coord = wcs.pixel_to_world(x, y)
+                objects.append({
+                    'name': name,
+                    'ra': coord.ra.deg,
+                    'dec': coord.dec.deg,
+                    'x': x,
+                    'y': y,
+                    'mag': 10.0,
+                    'type': 'star',
+                    'importance': 'medium'
+                })
             except:
                 pass
         
-        radius = max([center.separation(corner).deg for corner in corners]) if corners else 0.5
-        
-        # Query Vizier for bright stars
-        v = Vizier(column_filters={"Vmag": f"<{magnitude_limit}"}, row_limit=max_stars*3)
-        
-        # Try Hipparcos catalog
-        result = v.query_region(center, radius=radius*u.deg, catalog="I/239/hip_main")
-        
-        # Process results
-        stars = []
-        if result:
-            table = result[0]
-            for row in table:
-                try:
-                    ra = row['_RAJ2000']
-                    dec = row['_DEJ2000']
-                    coord = SkyCoord(ra=ra, dec=dec, unit='deg')
-                    x, y = wcs.world_to_pixel(coord)
-                    
-                    # Skip if outside image
-                    if x < 0 or x >= nx or y < 0 or y >= ny:
-                        continue
-                    
-                    # Get magnitude and name
-                    mag = row['Vmag'] if 'Vmag' in row.colnames else 999
-                    name = f"HIP {row['HIP']}" if 'HIP' in row.colnames else f"Star {len(stars)+1}"
-                    
-                    stars.append({
-                        'name': name,
-                        'ra': ra,
-                        'dec': dec,
-                        'x': x,
-                        'y': y,
-                        'mag': mag,
-                        'type': 'star'
-                    })
-                except Exception as e:
-                    print(f"Error processing star: {e}")
+        return objects
+    
+    def add_object_labels(ax, objects, fontsize=10, marker=None, marker_size=4, 
+                         fontweight='bold', bbox_props=None):
+        """Fallback implementation for adding object labels"""
+        if not objects:
+            return []
             
-            # Sort by magnitude
-            stars.sort(key=lambda x: x.get('mag', 999))
+        if bbox_props is None:
+            bbox_props = dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.6)
         
-        return stars[:max_stars]
-        
-    except Exception as e:
-        print(f"Error in minimal star query: {e}")
-        return []
+        elements = []
+        for obj in objects:
+            try:
+                x, y = obj['x'], obj['y']
+                name = obj['name']
+                
+                # Add marker
+                if marker:
+                    m = ax.plot(x, y, marker, color='yellow', ms=marker_size, mew=1.0)[0]
+                    elements.append(m)
+                
+                # Add label
+                t = ax.text(x + 10, y + 10, name, color='yellow', fontsize=fontsize,
+                          fontweight=fontweight, bbox=bbox_props)
+                elements.append(t)
+            except:
+                pass
+                
+        return elements
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning, append=True)
@@ -409,37 +438,20 @@ class FitsBrowser(tk.Tk):
         except ImportError:
             print("sky_location.py not found - Sky Location button not added")
         
-        # Create processing controls
+        # Create processing controls with simplified object labeling
         proc_callbacks = {
             'save_image': self.save_image,
             'show_fits_info': self.show_fits_info,
             'show_sky_location': self.show_sky_location,
-            'show_object_labels': self.show_object_labels
+            'toggle_object_labels': self.toggle_object_labels
         }
         
         self.proc_frame = ui_components.create_processing_controls(
             self.control_frame,
             proc_callbacks,
-            has_sky_location
+            has_sky_location,
+            has_toggle_labels=True  # New parameter to indicate we want a toggle button
         )
-        
-        # Create object labeling controls
-        obj_callbacks = {
-            'on_mag_change': self.on_mag_change,
-            'show_object_labels': self.show_object_labels,
-            'clear_object_labels': self.clear_object_labels
-        }
-        
-        obj_components = ui_components.create_object_labeling_controls(
-            self.control_frame,
-            obj_callbacks,
-            self.settings
-        )
-        
-        # Store references to components
-        self.mag_var = obj_components['mag_var']
-        self.max_stars_var = obj_components['max_stars_var']
-        self.mag_label = obj_components['mag_label']
     
     def show_sky_location(self):
         """Show sky location of the current FITS file"""
@@ -481,12 +493,17 @@ class FitsBrowser(tk.Tk):
         
         # Redraw the canvas
         self.canvas.draw()
-        self.status_bar['text'] = "Object labels cleared"
+        self.status_bar['text'] = "Object labels removed"
     
-    def show_object_labels(self):
-        """Show celestial object labels on the current FITS file"""
+    def toggle_object_labels(self):
+        """Toggle celestial object labels on/off for the current FITS file"""
         if not self.current_file:
             messagebox.showinfo("Info", "No file loaded")
+            return
+            
+        # If labels are active, remove them
+        if self.object_labels_active:
+            self.clear_object_labels()
             return
             
         # Check if we have WCS information
@@ -497,213 +514,70 @@ class FitsBrowser(tk.Tk):
             wcs = WCS(header).celestial
             if not wcs.has_celestial:
                 raise ValueError("No celestial WCS available")
+                
+            # Print header info for debugging
+            print("\nFITS Header Information for WCS debugging:")
+            for key in ['NAXIS1', 'NAXIS2', 'CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2', 'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2', 
+                       'CTYPE1', 'CTYPE2', 'CUNIT1', 'CUNIT2', 'OBJECT', 'TARGNAME', 'TARGET', 'EQUINOX']:
+                if key in header:
+                    print(f"{key} = {header[key]}")
+                    
+            # Some FITS files use PC matrix instead of CD matrix
+            for key in ['PC1_1', 'PC1_2', 'PC2_1', 'PC2_2']:
+                if key in header:
+                    print(f"{key} = {header[key]}")
+                    
+            # Some FITS files use older CDELT keywords
+            for key in ['CDELT1', 'CDELT2']:
+                if key in header:
+                    print(f"{key} = {header[key]}")
+                    
         except Exception as e:
             messagebox.showerror("Error", f"Could not get WCS information: {e}")
             return
-            
-        # Clear any existing labels
-        self.clear_object_labels()
-        
-        # Set parameters from settings
-        mag_limit = self.settings['mag_limit']
-        try:
-            max_stars = self.max_stars_var.get()
-        except:
-            max_stars = 25  # Default if widget not available
-            
-        max_deep_sky = self.settings.get('max_deep_sky', 10)
         
         # Update status
-        self.status_bar['text'] = f"Querying catalog data (mag limit: {mag_limit:.1f})..."
+        self.status_bar['text'] = "Finding objects in field..."
         self.update_idletasks()
         
-        # Use a thread to prevent UI freezing during catalog query
+        # Use a thread to prevent UI freezing during search
         def add_labels_thread():
             try:
-                # Initialize objects list
-                objects = []
-                
-                # Try to import catalog_query first (new dedicated module)
-                try:
-                    import catalog_query
-                    # Use the more robust catalog query function
-                    print("Using catalog_query module for star querying")
-                    stars = catalog_query.query_star_catalog(wcs, header, max_stars, mag_limit)
-                    objects = stars  # Use just the stars for now
-
-                # Fall back to object_labels if catalog_query not available
-                except ImportError:
-                    try:
-                        # Try to use object_labels if available
-                        from object_labels import query_bright_stars, query_deep_sky_objects
-                        print("Using object_labels module")
-                        
-                        # Query stars with our magnitude limit
-                        stars = query_bright_stars(wcs, header, max_stars=max_stars, magnitude_limit=mag_limit)
-                        # Query deep sky objects
-                        deep_sky = query_deep_sky_objects(wcs, header, max_objects=max_deep_sky)
-                        
-                        # Combine objects
-                        objects = stars + deep_sky
-                    
-                    except ImportError:
-                        # Direct astroquery fallback - simplified and focused on most reliable catalog
-                        print("Using direct astroquery fallback")
-                        try:
-                            from astroquery.vizier import Vizier
-                            import astropy.units as u
-                            
-                            # Get center coordinates
-                            ny, nx = header.get('NAXIS2', 1000), header.get('NAXIS1', 1000)
-                            center = wcs.pixel_to_world(nx/2, ny/2)
-                            print(f"Image center: RA={center.ra.deg:.3f}°, Dec={center.dec.deg:.3f}°")
-                            
-                            # Calculate field radius
-                            corners = []
-                            for x, y in [(0, 0), (nx, 0), (nx, ny), (0, ny)]:
-                                try:
-                                    corner = wcs.pixel_to_world(x, y)
-                                    corners.append(corner)
-                                except:
-                                    pass
-                            
-                            radius = max([center.separation(corner).deg for corner in corners]) if corners else 0.5
-                            print(f"Field radius: {radius:.3f}°")
-                            
-                            # Query the Yale Bright Star Catalog directly with NO column filters
-                            # This is often more reliable for initial testing
-                            v = Vizier(columns=['*', '+_r'])
-                            v.ROW_LIMIT = 100  # Get more stars
-                            
-                            result = v.query_region(center, radius=radius*u.deg, catalog="V/50")
-                            
-                            if result and len(result) > 0:
-                                table = result[0]
-                                print(f"Found {len(table)} objects in Yale Bright Star Catalog")
-                                print(f"Columns: {table.colnames}")
-                                
-                                # Process the results into our standard format
-                                for row in table:
-                                    try:
-                                        # Get coordinates from the Yale catalog, which should have consistent columns
-                                        ra = row['RAJ2000']  # Yale uses 'RAJ2000' not '_RAJ2000'
-                                        dec = row['DEJ2000']  # Yale uses 'DEJ2000' not '_DEJ2000'
-                                        
-                                        coord = SkyCoord(ra=ra, dec=dec, unit=(u.hourangle, u.deg))
-                                        x, y = wcs.world_to_pixel(coord)
-                                        
-                                        # Skip if outside image
-                                        if x < 0 or x >= nx or y < 0 or y >= ny:
-                                            continue
-                                        
-                                        # Get magnitude from Yale catalog (reliable)
-                                        mag = row['Vmag'] if 'Vmag' in row.colnames else 999
-                                        if mag > mag_limit:
-                                            continue
-                                        
-                                        # Star name from Yale catalog
-                                        name = f"HR {row['HR']}" if 'HR' in row.colnames else f"Star {len(objects)+1}"
-                                        
-                                        objects.append({
-                                            'name': name,
-                                            'ra': coord.ra.deg,
-                                            'dec': coord.dec.deg,
-                                            'x': x,
-                                            'y': y,
-                                            'mag': mag,
-                                            'type': 'star'
-                                        })
-                                    except Exception as e:
-                                        print(f"Error processing Yale star: {e}")
-                            else:
-                                print("No results from Yale catalog")
-                        
-                        except Exception as e:
-                            print(f"Error in direct catalog query: {e}")
-                
-                # We should have objects now, from one of the methods
-                print(f"Found {len(objects)} objects to label")
+                # Find objects in field using the curated database - use high values to get all objects
+                print(f"\nQuerying objects for {os.path.basename(self.current_file)}")
+                objects = find_objects_in_field(wcs, header, max_objects=100, magnitude_limit=20.0)
                 
                 # No objects found
                 if not objects:
-                    self.status_bar['text'] = f"No objects found (mag limit: {mag_limit:.1f})"
+                    self.status_bar['text'] = f"No celestial objects found in this field."
                     return
                 
-                # Set up label colors
-                label_colors = {
-                    'star': 'yellow',
-                    'galaxy': 'cyan',
-                    'nebula': 'magenta',
-                    'cluster': 'green',
-                    'deep_sky': 'red',
-                    'other': 'white'
-                }
+                print(f"Found {len(objects)} objects to label")
                 
                 # Create more visible text box properties
                 bbox_props = dict(
                     boxstyle='round,pad=0.3',
                     facecolor='black',
-                    alpha=0.6,
-                    edgecolor='none'
+                    alpha=0.7,
+                    edgecolor='gray',
+                    pad=0.5
                 )
                 
-                # Add labels to the plot - try different methods in order
-                try:
-                    # Try catalog_query module first (if available)
-                    import catalog_query
-                    elements = catalog_query.add_object_labels(
-                        self.ax, objects, 
-                        fontsize=10, 
-                        marker=None,  # No markers
-                        marker_size=0,
-                        fontweight='bold',
-                        bbox_props=bbox_props
-                    )
-                    
-                except ImportError:
-                    try:
-                        # Try object_labels module if available
-                        from object_labels import add_object_labels
-                        elements = add_object_labels(
-                            self.ax, objects, 
-                            fontsize=10, 
-                            color='white',
-                            marker='o',
-                            show_marker=True,
-                            marker_size=12,
-                            only_show_brightest=False,
-                            label_colors=label_colors
-                        )
-                    except ImportError:
-                        # Fallback to built-in function
-                        elements = []
-                        for obj in objects:
-                            try:
-                                x, y = obj['x'], obj['y']
-                                name = obj['name']
-                                obj_type = obj.get('type', 'other')
-                                
-                                # Choose color based on object type
-                                color = label_colors.get(obj_type, 'white')
-                                
-                                # Add marker
-                                m = self.ax.plot(x, y, 'o', color=color, ms=12, mew=1.5, zorder=100)[0]
-                                elements.append(m)
-                                
-                                # Add text label
-                                t = self.ax.text(x + 15, y + 15, name, color=color, fontsize=10, fontweight='bold',
-                                             bbox=bbox_props, ha='left', va='center', zorder=101)
-                                elements.append(t)
-                                
-                            except Exception as e:
-                                print(f"Error adding label: {e}")
+                # Add labels to the plot
+                print("Adding labels to plot")
+                self.object_label_elements = add_object_labels(
+                    self.ax, objects, 
+                    fontsize=10, 
+                    marker='o',
+                    marker_size=8,
+                    fontweight='bold',
+                    bbox_props=bbox_props
+                )
                 
-                # Store the elements
-                self.object_label_elements = elements
                 self.object_labels_active = True
                 
                 # Update status bar
-                self.status_bar['text'] = f"Added {len(objects)} object labels (mag limit: {mag_limit:.1f})"
+                self.status_bar['text'] = f"Added {len(objects)} object labels"
                 
                 # Redraw the canvas
                 self.canvas.draw()

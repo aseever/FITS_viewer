@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-catalog_query.py - Direct catalog querying functions for astronomical catalogs
+catalog_query.py - Streamlined catalog querying for astronomical catalogs
 
-This module provides robust catalog querying functions that work with various catalog formats
-and column naming conventions. It's designed to be more resilient to catalog format changes.
+This version focuses only on the catalogs that work reliably and 
+removes unnecessary complexity to prevent hanging.
 """
 
 import numpy as np
+import math
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import astropy.units as u
@@ -14,30 +15,16 @@ import warnings
 
 def query_star_catalog(wcs, header, max_stars=25, magnitude_limit=12.0):
     """
-    Query stars directly from catalogs with robust error handling
-    
-    Parameters:
-    -----------
-    wcs : astropy.wcs.WCS
-        WCS object for coordinate transformations
-    header : astropy.io.fits.Header
-        FITS header with image dimensions
-    max_stars : int
-        Maximum number of stars to return
-    magnitude_limit : float
-        Magnitude limit for star queries
-        
-    Returns:
-    --------
-    list : List of star dictionaries with coordinates and metadata
+    Query stars from catalogs that are known to work reliably
     """
     try:
         from astroquery.vizier import Vizier
+        import astropy.units as u
     except ImportError:
         print("astroquery not installed - star catalog querying not available")
         return []
         
-    print(f"Querying star catalogs with magnitude limit {magnitude_limit:.1f}...")
+    print(f"Querying catalogs with magnitude limit {magnitude_limit:.1f}...")
     
     try:
         # Get image dimensions
@@ -47,7 +34,7 @@ def query_star_catalog(wcs, header, max_stars=25, magnitude_limit=12.0):
         center = wcs.pixel_to_world(nx/2, ny/2)
         print(f"Image center: RA={center.ra.deg:.3f}°, Dec={center.dec.deg:.3f}°")
         
-        # Calculate approximate field radius (using corners)
+        # Calculate field radius
         corners = []
         for x, y in [(0, 0), (nx, 0), (nx, ny), (0, ny)]:
             try:
@@ -56,265 +43,319 @@ def query_star_catalog(wcs, header, max_stars=25, magnitude_limit=12.0):
             except:
                 pass
         
-        # Use maximum separation for radius
-        if corners:
-            radius = max([center.separation(corner).deg for corner in corners])
-            print(f"Field radius: {radius:.3f}°")
-        else:
-            # Default radius if corners can't be determined
-            radius = 0.5
-            print(f"Using default field radius: {radius:.3f}°")
+        radius = max([center.separation(corner).deg for corner in corners]) if corners else 0.5
+        print(f"Field radius: {radius:.3f}°")
         
-        # Get stars from all available catalogs
+        # Get target from header (if available)
+        target_name = None
+        for key in ['OBJECT', 'TARGNAME', 'TARGET']:
+            if key in header and header[key] and str(header[key]).strip():
+                target_name = str(header[key]).strip()
+                print(f"Target from header: {target_name}")
+                break
+
+        # Initialize stars list
         all_stars = []
         
-        # Direct HD/name lookup for this specific RA/Dec region using a larger radius
-        # This helps find known bright stars that might be just outside the field
-        known_bright_stars = direct_lookup_bright_stars(center, radius * 1.5)
-        print(f"Direct lookup found {len(known_bright_stars)} known bright stars")
+        # Only use catalogs that have proven successful
+        successful_catalogs = [
+            "V/50",       # Yale Bright Star Catalog
+            "V/136",      # Tycho-2
+            "II/246"      # 2MASS
+        ]
         
-        # Filter the bright stars to those actually in our field
-        in_field_stars = []
-        for star in known_bright_stars:
-            try:
-                x, y = wcs.world_to_pixel(SkyCoord(ra=star['ra'], dec=star['dec'], unit='deg'))
-                if 0 <= x < nx and 0 <= y < ny:
-                    star['x'] = x
-                    star['y'] = y
-                    in_field_stars.append(star)
-            except:
-                pass
+        # Set up column filters based on magnitude limit
+        column_filters = {}
+        if magnitude_limit < 90:  # Only apply if reasonable magnitude limit
+            column_filters = {"Vmag": f"<{magnitude_limit+1}"}
         
-        all_stars.extend(in_field_stars)
-        print(f"Found {len(in_field_stars)} known bright stars in field")
+        # Configure Vizier with reasonable timeout and row limits
+        v = Vizier(
+            columns=["*"],
+            column_filters=column_filters,
+            row_limit=100
+        )
         
-        # If we have few stars, try catalog queries
-        if len(all_stars) < max_stars:
-            # Set up Vizier query with flexible columns - no magnitude filter to ensure we get results
-            vizier = Vizier(
-                columns=['*', '+_r'],  # All columns plus angular distance
-                row_limit=max_stars * 5  # Get more to allow filtering
-            )
+        # Query Yale first (most reliable for named stars)
+        try:
+            print("Querying Yale Bright Star Catalog...")
+            result = v.query_region(center, radius=radius*u.deg, catalog="V/50")
             
-            # Suppress warnings during queries
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
+            if result and len(result) > 0:
+                table = result[0]
+                print(f"Found {len(table)} stars in Yale catalog")
                 
-                # Try multiple catalogs in order of preference:
-                # 1. Classic bright star catalogs with simple designations (Yale/Harvard) 
-                # 2. Standard professional catalogs (Hipparcos, Tycho)
-                # 3. Modern large surveys (Gaia, etc.)
-                catalogs = [
-                    "V/50",             # Yale Bright Star Catalog (best for readable names HR numbers)
-                    "I/239/hip_main",   # Hipparcos
-                    "I/311/hip2",       # Hipparcos-2
-                    "V/136/tycall",     # Tycho-2
-                    "I/290/out",        # UCAC3
-                    "I/355/gaiadr3",    # Gaia DR3
-                    "II/246/out",       # 2MASS
-                ]
-                
-                # First try Yale catalog without a magnitude filter (most reliable)
-                print("Trying Yale Bright Star Catalog without magnitude filter")
-                try:
-                    result = vizier.query_region(center, radius=radius*u.deg, catalog="V/50")
-                    if result and len(result) > 0:
-                        table = result[0]
-                        print(f"Found {len(table)} stars in Yale Bright Star Catalog")
-                        # Process the table with basic processing first
-                        stars = process_catalog_table(table, wcs, nx, ny, "V/50")
-                        # Now filter by magnitude
-                        bright_stars = [s for s in stars if s.get('mag', 999) <= magnitude_limit]
-                        print(f"After magnitude filtering: {len(bright_stars)} stars")
+                for i, row in enumerate(table):
+                    try:
+                        # Get coordinates
+                        ra = row['RAJ2000']
+                        dec = row['DEJ2000']
+                        coord = SkyCoord(ra=ra, dec=dec, unit='deg')
                         
-                        # For the Yale catalog, add proper names to the stars if available
-                        if bright_stars:
-                            try:
-                                add_proper_names_to_stars(bright_stars)
-                            except Exception as e:
-                                print(f"Error adding proper names: {e}")
-                                
-                        all_stars.extend(bright_stars)
-                except Exception as e:
-                    print(f"Error with Yale catalog: {e}")
-                
-                # If we don't have enough stars, try the other catalogs
-                if len(all_stars) < max_stars:
-                    for catalog in catalogs:
-                        # Skip Yale, we already tried it
-                        if catalog == "V/50":
+                        # Convert to pixel coordinates
+                        x, y = wcs.world_to_pixel(coord)
+                        
+                        # Skip if outside image
+                        if x < 0 or x >= nx or y < 0 or y >= ny:
                             continue
+                        
+                        # Get magnitude
+                        mag = row['Vmag'] if 'Vmag' in row.colnames else 999
+                        
+                        # Generate name - prefer HR number for Yale catalog
+                        name = None
+                        if 'HR' in row.colnames:
+                            hr_num = row['HR']
+                            name = f"HR {hr_num}"
                             
+                            # Check if this HR number has a common name
+                            common_name = get_common_star_name(hr_num)
+                            if common_name:
+                                name = common_name
+                        elif 'HD' in row.colnames:
+                            name = f"HD {row['HD']}"
+                        else:
+                            name = f"BS {i+1}"
+                        
+                        # Set importance based on magnitude
+                        importance = 'low'
+                        if mag < 3.0:
+                            importance = 'high'
+                        elif mag < 5.0:
+                            importance = 'medium'
+                        
+                        # Add to list
+                        all_stars.append({
+                            'name': name,
+                            'ra': coord.ra.deg,
+                            'dec': coord.dec.deg,
+                            'x': x,
+                            'y': y,
+                            'mag': mag,
+                            'type': 'star',
+                            'catalog': 'Yale',
+                            'importance': importance
+                        })
+                    except Exception as e:
+                        print(f"Error with Yale star {i}: {e}")
+        except Exception as e:
+            print(f"Yale catalog error: {e}")
+        
+        # Query Tycho-2 only if we need more stars
+        if len(all_stars) < max_stars:
+            try:
+                print("Querying Tycho-2 catalog...")
+                result = v.query_region(center, radius=radius*u.deg, catalog="V/136")
+                
+                if result and len(result) > 0:
+                    table = result[0]
+                    print(f"Found {len(table)} stars in Tycho-2 catalog")
+                    
+                    for i, row in enumerate(table):
                         try:
-                            print(f"Trying catalog: {catalog}")
-                            result = vizier.query_region(center, radius=radius*u.deg, catalog=catalog)
-                            
-                            if not result or len(result) == 0:
-                                print(f"No results from catalog {catalog}")
-                                continue
-                                
-                            # Get the table
-                            table = result[0]
-                            print(f"Found {len(table)} objects in catalog {catalog}")
-                            
-                            # Process the table
-                            stars = process_catalog_table(table, wcs, nx, ny, catalog)
-                            
-                            # Filter by magnitude
-                            bright_stars = [s for s in stars if s.get('mag', 999) <= magnitude_limit]
-                            
-                            # Add to our list
-                            all_stars.extend(bright_stars)
-                            print(f"After processing: {len(bright_stars)} stars from {catalog}")
-                            
-                            # Break if we have enough stars
+                            # Skip if we have enough stars already
                             if len(all_stars) >= max_stars:
                                 break
                                 
+                            # Get coordinates
+                            ra = row['RAmdeg'] if 'RAmdeg' in row.colnames else row['_RAJ2000']
+                            dec = row['DEmdeg'] if 'DEmdeg' in row.colnames else row['_DEJ2000']
+                            coord = SkyCoord(ra=ra, dec=dec, unit='deg')
+                            
+                            # Convert to pixel coordinates
+                            x, y = wcs.world_to_pixel(coord)
+                            
+                            # Skip if outside image
+                            if x < 0 or x >= nx or y < 0 or y >= ny:
+                                continue
+                            
+                            # Get magnitude
+                            mag = row['VTmag'] if 'VTmag' in row.colnames else 999
+                            
+                            # Skip stars that exceed magnitude limit
+                            if mag > magnitude_limit:
+                                continue
+                            
+                            # Check if this star is already in our list
+                            is_duplicate = False
+                            for star in all_stars:
+                                dx = star['x'] - x
+                                dy = star['y'] - y
+                                if math.sqrt(dx*dx + dy*dy) < 5:  # If within 5 pixels
+                                    is_duplicate = True
+                                    break
+                            
+                            if is_duplicate:
+                                continue
+                                
+                            # Generate name for Tycho-2 stars
+                            name = f"TYC {row['TYC1']}-{row['TYC2']}-{row['TYC3']}" if all(x in row.colnames for x in ['TYC1', 'TYC2', 'TYC3']) else f"TYC {i+1}"
+                            
+                            # Calculate distance from center (for importance)
+                            dx, dy = x - nx/2, y - ny/2
+                            center_dist = math.sqrt(dx*dx + dy*dy) / math.sqrt(nx*nx + ny*ny)
+                            
+                            # Set importance based on magnitude and position
+                            importance = 'low'
+                            if mag < 5.0 or center_dist < 0.1:  # Very bright or near center
+                                importance = 'medium'
+                                
+                            # Add to our list
+                            all_stars.append({
+                                'name': name,
+                                'ra': coord.ra.deg,
+                                'dec': coord.dec.deg,
+                                'x': x,
+                                'y': y,
+                                'mag': mag,
+                                'type': 'star',
+                                'catalog': 'Tycho-2',
+                                'importance': importance
+                            })
                         except Exception as e:
-                            print(f"Error with catalog {catalog}: {e}")
+                            print(f"Error with Tycho star {i}: {e}")
+            except Exception as e:
+                print(f"Tycho catalog error: {e}")
         
-        # If we still don't have enough stars, add generic "Star X" entries for bright points
-        if len(all_stars) < 3:
-            print("Few named stars found. Adding generic stars based on brightness.")
-            generic_stars = find_bright_points_in_image(wcs, header, data=None, max_points=max_stars)
-            all_stars.extend(generic_stars)
-        
-        # Remove duplicates (might have the same star from different catalogs)
-        # Use a simple distance metric to identify duplicates
-        unique_stars = []
-        for star in all_stars:
-            is_duplicate = False
-            for unique_star in unique_stars:
-                # Calculate pixel distance
-                dx = star['x'] - unique_star['x']
-                dy = star['y'] - unique_star['y']
-                distance = np.sqrt(dx*dx + dy*dy)
+        # Query 2MASS as a last resort
+        if len(all_stars) < max_stars * 0.5:  # Only if we have less than half the stars we want
+            try:
+                print("Querying 2MASS catalog...")
+                result = v.query_region(center, radius=radius*u.deg, catalog="II/246")
                 
-                # If distance is small, consider it a duplicate
-                if distance < 5:
-                    is_duplicate = True
+                if result and len(result) > 0:
+                    table = result[0]
+                    print(f"Found {len(table)} objects in 2MASS catalog")
                     
-                    # If the new star has a better name (not a Star X), replace the old one
-                    if not star['name'].startswith('Star ') and unique_star['name'].startswith('Star '):
-                        unique_star['name'] = star['name']
-                        
+                    for i, row in enumerate(table):
+                        try:
+                            # Skip if we have enough stars
+                            if len(all_stars) >= max_stars:
+                                break
+                                
+                            # Get coordinates
+                            ra = row['RAJ2000']
+                            dec = row['DEJ2000']
+                            coord = SkyCoord(ra=ra, dec=dec, unit='deg')
+                            
+                            # Convert to pixel coordinates
+                            x, y = wcs.world_to_pixel(coord)
+                            
+                            # Skip if outside image
+                            if x < 0 or x >= nx or y < 0 or y >= ny:
+                                continue
+                            
+                            # Check if this star is already in our list (avoid duplicates)
+                            is_duplicate = False
+                            for star in all_stars:
+                                dx = star['x'] - x
+                                dy = star['y'] - y
+                                if math.sqrt(dx*dx + dy*dy) < 5:  # If within 5 pixels
+                                    is_duplicate = True
+                                    break
+                            
+                            if is_duplicate:
+                                continue
+                            
+                            # Use 2MASS designation for name
+                            name = f"2MASS J{row['2MASS']}" if '2MASS' in row.colnames else f"2MASS J{i+1}"
+                            
+                            # Add star with low importance (2MASS is less preferred)
+                            all_stars.append({
+                                'name': name,
+                                'ra': coord.ra.deg,
+                                'dec': coord.dec.deg,
+                                'x': x,
+                                'y': y,
+                                'mag': 999,  # 2MASS doesn't have V magnitudes
+                                'type': 'star',
+                                'catalog': '2MASS',
+                                'importance': 'low'
+                            })
+                        except Exception as e:
+                            print(f"Error with 2MASS object {i}: {e}")
+            except Exception as e:
+                print(f"2MASS catalog error: {e}")
+        
+        # If we have a named target from the header, try to add it
+        if target_name and len(all_stars) > 0:
+            # See if we can determine center star position from existing stars
+            center_x, center_y = nx/2, ny/2
+            
+            # Create a target object at the center
+            target_obj = {
+                'name': target_name,
+                'x': center_x,
+                'y': center_y,
+                'ra': center.ra.deg,
+                'dec': center.dec.deg,
+                'mag': 999,
+                'type': 'star',
+                'catalog': 'header',
+                'importance': 'high'
+            }
+            
+            # Check if this is very close to an existing star
+            replace_existing = False
+            for i, star in enumerate(all_stars):
+                dx = star['x'] - center_x
+                dy = star['y'] - center_y
+                if math.sqrt(dx*dx + dy*dy) < 10:  # If very close to center
+                    # Replace this star with our target
+                    all_stars[i]['name'] = target_name
+                    all_stars[i]['importance'] = 'high'
+                    replace_existing = True
                     break
             
-            if not is_duplicate:
-                unique_stars.append(star)
+            # If we didn't replace an existing star, add the target
+            if not replace_existing:
+                all_stars.append(target_obj)
         
-        # Sort stars by magnitude and limit to max_stars
-        unique_stars.sort(key=lambda x: x.get('mag', 999))
-        final_stars = unique_stars[:max_stars]
+        # If we still don't have enough stars, add generic points
+        if len(all_stars) < 3:
+            generic_stars = generate_generic_stars(wcs, nx, ny, max_points=max_stars)
+            
+            # Add unique stars
+            next_star_number = 1
+            for star in generic_stars:
+                # Check if this position already has a star
+                is_duplicate = False
+                for existing_star in all_stars:
+                    dx = star['x'] - existing_star['x']
+                    dy = star['y'] - existing_star['y']
+                    if math.sqrt(dx*dx + dy*dy) < 8:
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    star['name'] = f"Star {next_star_number}"
+                    next_star_number += 1
+                    all_stars.append(star)
+        
+        # Sort by importance then magnitude
+        all_stars.sort(key=lambda x: (
+            0 if x.get('importance') == 'high' else (1 if x.get('importance') == 'medium' else 2),
+            x.get('mag', 999)
+        ))
+        
+        # Limit to max_stars
+        final_stars = all_stars[:max_stars]
         
         print(f"Final star count: {len(final_stars)}")
         return final_stars
-            
+        
     except Exception as e:
-        print(f"Error in star catalog query: {e}")
+        print(f"Catalog query error: {e}")
         import traceback
         traceback.print_exc()
         return []
 
-def direct_lookup_bright_stars(center, radius):
-    """
-    Direct lookup of known bright stars near the given coordinates
-    
-    This function contains a small database of well-known bright stars
-    to ensure we always have good labels even if catalog queries fail.
-    
-    Parameters:
-    -----------
-    center : astropy.coordinates.SkyCoord
-        Center of the field
-    radius : float
-        Radius of the field in degrees
-        
-    Returns:
-    --------
-    list : List of star dictionaries
-    """
-    # Small database of the brightest stars with common names
-    # Format: [RA(deg), Dec(deg), Magnitude, "Name (Catalog)"]
-    bright_stars_db = [
-        [0.0, 0.0, 5.0, "Dummy"],  # Placeholder to avoid empty list issues
-        
-        # First magnitude stars (brightest)
-        [219.9, -60.8, -0.72, "Alpha Centauri (HD 128620)"],
-        [114.8, 5.2, -0.27, "Sirius (HD 48915)"],
-        [278.5, 38.8, 0.03, "Vega (HD 172167)"],
-        [95.7, -52.7, 0.12, "Canopus (HD 45348)"],
-        [210.9, -60.4, 0.13, "Alpha Centauri B (HD 128621)"],
-        [101.3, -16.7, 0.45, "Rigil Kentaurus (HD 45348)"],
-        [104.7, -28.9, 0.6, "Hadar (HD 68702)"],
-        [213.9, 19.2, 0.77, "Arcturus (HD 124897)"],
-        [28.7, 7.4, 0.87, "Procyon (HD 61421)"],
-        [88.8, 7.4, 0.98, "Achernar (HD 10144)"],
-        
-        # Other bright and well-known stars
-        [310.4, 45.3, 1.25, "Deneb (HD 197345)"],
-        [297.7, 8.9, 1.3, "Altair (HD 187642)"],
-        [78.6, -8.2, 1.64, "Betelgeuse (HD 39801)"],
-        [113.6, 31.9, 1.79, "Capella (HD 34029)"],
-        [83.8, -5.9, 1.7, "Rigel (HD 34085)"],
-        [37.9, 89.3, 2.0, "Polaris (HD 8890)"],
-        
-        # Some additional northern stars
-        [206.9, 49.3, 1.9, "Alkaid (HD 120315)"],
-        [200.9, 54.9, 2.4, "Mizar (HD 116656)"],
-        [152.1, 11.9, 1.4, "Regulus (HD 87901)"],
-        [165.9, 61.8, 2.3, "Dubhe (HD 95689)"],
-        
-        # Easily recognized southern stars
-        [137.7, -69.7, 1.9, "Miaplacidus (HD 68520)"],
-        [84.1, -1.2, 2.8, "Mintaka (HD 36486)"],
-        [81.3, -2.4, 2.2, "Alnilam (HD 35468)"],
-        [76.9, -5.1, 4.6, "Alnitak (HD 37742)"],
-        [59.5, 40.0, 2.1, "Almach (HD 12533)"],
-    ]
-    
-    stars = []
-    
-    # Check each star in the database
-    for ra, dec, mag, name in bright_stars_db:
-        try:
-            # Create a SkyCoord for the star
-            star_coord = SkyCoord(ra=ra, dec=dec, unit='deg')
-            
-            # Calculate separation from center
-            separation = center.separation(star_coord).deg
-            
-            # If within radius, add to list
-            if separation <= radius:
-                # Parse name and catalog
-                if '(' in name and ')' in name:
-                    proper_name = name.split('(')[0].strip()
-                    catalog_id = name.split('(')[1].split(')')[0].strip()
-                else:
-                    proper_name = name
-                    catalog_id = ""
-                
-                stars.append({
-                    'name': proper_name,
-                    'ra': ra,
-                    'dec': dec,
-                    'mag': mag,
-                    'type': 'star',
-                    'catalog': 'direct_lookup',
-                    'catalog_id': catalog_id
-                })
-        except Exception as e:
-            print(f"Error with direct star lookup: {e}")
-    
-    return stars
-
-def add_proper_names_to_stars(stars):
-    """Add proper names to stars if available"""
-    # Small database of HR numbers to common names
+def get_common_star_name(hr_number):
+    """Get common name for well-known bright stars by HR number"""
+    # Dictionary of HR numbers to common names
     hr_to_name = {
         2491: "Sirius",
-        5340: "Arcturus",
+        5340: "Arcturus", 
         7001: "Vega",
         1457: "Aldebaran",
         2943: "Procyon",
@@ -323,220 +364,87 @@ def add_proper_names_to_stars(stars):
         5191: "Spica",
         2061: "Betelgeuse",
         2990: "Pollux",
-        7121: "Formalhaut",
+        7121: "Fomalhaut",
         4853: "Regulus",
         8728: "Deneb",
         6134: "Antares",
         472: "Achernar",
         5459: "Alpha Centauri",
-        9884: "Achernar",
         5267: "Hadar",
-        99: "Polaris"
+        99: "Polaris",
+        4763: "Alphard",
+        5056: "Mizar",
+        4905: "Alioth",
+        3982: "Castor",
+        677: "Mirfak"
     }
     
-    for star in stars:
+    return hr_to_name.get(int(hr_number), None)
+
+def generate_generic_stars(wcs, nx, ny, max_points=10):
+    """Generate generic stars at reasonable positions when catalogs fail"""
+    stars = []
+    
+    # Always include center
+    center_x, center_y = nx/2, ny/2
+    try:
+        coord = wcs.pixel_to_world(center_x, center_y)
+        stars.append({
+            'ra': coord.ra.deg,
+            'dec': coord.dec.deg,
+            'x': center_x,
+            'y': center_y,
+            'mag': 8.0,
+            'type': 'star',
+            'catalog': 'generic',
+            'importance': 'medium'
+        })
+    except:
+        pass
+    
+    # Add a few points at typical positions
+    positions = [
+        (0.25, 0.25),  # Upper left quadrant
+        (0.75, 0.25),  # Upper right quadrant
+        (0.25, 0.75),  # Lower left quadrant
+        (0.75, 0.75),  # Lower right quadrant
+        (0.5, 0.25),   # Top middle
+        (0.5, 0.75),   # Bottom middle
+        (0.3, 0.5),    # Left middle
+        (0.7, 0.5),    # Right middle
+    ]
+    
+    for i, (rx, ry) in enumerate(positions):
+        if i >= max_points - 1:
+            break
+            
+        x, y = int(rx * nx), int(ry * ny)
+        
+        # Skip if too close to center
+        if abs(x - center_x) < 10 and abs(y - center_y) < 10:
+            continue
+            
         try:
-            # Check if the star has an HR number
-            name = star['name']
-            if name.startswith('HR '):
-                hr_num = int(name.split(' ')[1])
-                if hr_num in hr_to_name:
-                    star['name'] = hr_to_name[hr_num]
+            coord = wcs.pixel_to_world(x, y)
+            stars.append({
+                'ra': coord.ra.deg,
+                'dec': coord.dec.deg,
+                'x': x,
+                'y': y,
+                'mag': 10.0,
+                'type': 'star',
+                'catalog': 'generic',
+                'importance': 'low'
+            })
         except:
             pass
     
     return stars
 
-def find_bright_points_in_image(wcs, header, data=None, max_points=10):
-    """
-    Find bright points in the image and add generic star labels
-    
-    This is a fallback method when catalog queries fail.
-    
-    Parameters:
-    -----------
-    wcs : astropy.wcs.WCS
-        WCS object for coordinate transformations
-    header : astropy.io.fits.Header
-        FITS header with image dimensions
-    data : numpy.ndarray or None
-        Image data (if None, just create a grid of points)
-    max_points : int
-        Maximum number of points to return
-        
-    Returns:
-    --------
-    list : List of star dictionaries
-    """
-    # If no data provided, create a grid of points
-    if data is None:
-        # Get image dimensions
-        ny, nx = header.get('NAXIS2', 1000), header.get('NAXIS1', 1000)
-        
-        # Create a simple grid of points
-        points = []
-        spacing = min(nx, ny) // (max_points + 1)
-        for i in range(1, max_points + 1):
-            x = spacing * i
-            y = spacing * i
-            
-            if x < nx and y < ny:
-                # Try to convert to world coordinates
-                try:
-                    coord = wcs.pixel_to_world(x, y)
-                    points.append({
-                        'name': f"Star {i}",
-                        'ra': coord.ra.deg,
-                        'dec': coord.dec.deg,
-                        'x': x,
-                        'y': y,
-                        'mag': 10.0,  # Generic magnitude
-                        'type': 'star',
-                        'catalog': 'generic'
-                    })
-                except:
-                    pass
-        
-        return points
-    
-    # TODO: If data is provided, implement a simple peak finding algorithm
-    # to identify bright stars automatically
-    return []
-
-def process_catalog_table(table, wcs, nx, ny, catalog_name):
-    """
-    Process a catalog table into a list of star dictionaries
-    
-    Parameters:
-    -----------
-    table : astropy.table.Table
-        Catalog table
-    wcs : astropy.wcs.WCS
-        WCS object for coordinate transformations
-    nx, ny : int
-        Image dimensions
-    catalog_name : str
-        Name of the catalog (for reference)
-        
-    Returns:
-    --------
-    list : List of star dictionaries
-    """
-    stars = []
-    
-    # Find the coordinate columns - different catalogs use different names
-    ra_col = find_column(table, ['_RAJ2000', 'RA_ICRS', 'RAJ2000', 'ra', 'RA', 'RAdeg'])
-    dec_col = find_column(table, ['_DEJ2000', 'DE_ICRS', 'DEJ2000', 'dec', 'DEC', 'DEdeg'])
-    
-    if not ra_col or not dec_col:
-        # Try direct coordinate access for some catalogs
-        if hasattr(table, 'ra') and hasattr(table, 'dec'):
-            ra_values = table.ra
-            dec_values = table.dec
-            has_coords = True
-        else:
-            print(f"Cannot find RA/DEC columns in {catalog_name}")
-            return []
-    else:
-        has_coords = False
-    
-    # Find magnitude column - different catalogs use different names
-    mag_col = find_column(table, ['Vmag', 'mag', 'magV', 'Gmag', 'Jmag', 'Hpmag', 'BTmag', 'VTmag'])
-    
-    # Find identifier column - different catalogs use different names
-    id_cols = ['ID', 'HIP', 'HD', 'HR', 'TYC', 'Gaia', 'NAME', 'Source', 'designation']
-    
-    # Process each star
-    for i, row in enumerate(table):
-        try:
-            # Get coordinates
-            if has_coords:
-                # Use table.ra and table.dec
-                ra = ra_values[i]
-                dec = dec_values[i]
-            else:
-                # Use column values
-                ra = row[ra_col]
-                dec = row[dec_col]
-            
-            # Create a SkyCoord object
-            try:
-                coord = SkyCoord(ra=ra, dec=dec, unit='deg')
-            except:
-                # Try alternative approach for some catalogs
-                coord = SkyCoord(ra=ra, dec=dec, unit=(u.hourangle, u.deg))
-            
-            # Convert to pixel coordinates
-            x, y = wcs.world_to_pixel(coord)
-            
-            # Skip if outside image
-            if x < 0 or x >= nx or y < 0 or y >= ny:
-                continue
-            
-            # Get magnitude
-            mag = 999
-            if mag_col and mag_col in row.colnames:
-                mag = row[mag_col]
-            
-            # Try to find an ID
-            name = None
-            for id_col in id_cols:
-                if id_col in row.colnames and row[id_col]:
-                    name = f"{id_col} {row[id_col]}"
-                    break
-            
-            if not name:
-                name = f"Star {len(stars)+1}"
-            
-            # Add to stars list
-            stars.append({
-                'name': name,
-                'ra': coord.ra.deg,
-                'dec': coord.dec.deg,
-                'x': x,
-                'y': y,
-                'mag': mag,
-                'type': 'star',
-                'catalog': catalog_name
-            })
-            
-        except Exception as e:
-            print(f"Error processing star {i}: {e}")
-    
-    return stars
-
-def find_column(table, possible_names):
-    """Find a column in a table by trying multiple possible names"""
-    for name in possible_names:
-        if name in table.colnames:
-            return name
-    return None
-
 def add_object_labels(ax, objects, fontsize=10, marker=None, marker_size=4, 
-                     fontweight='bold', bbox_props=None):
+                      fontweight='bold', bbox_props=None):
     """
     Add object labels to a plot
-    
-    Parameters:
-    -----------
-    ax : matplotlib.axes.Axes
-        Axes to add labels to
-    objects : list
-        List of object dictionaries
-    fontsize : int
-        Font size for labels
-    marker : str or None
-        Marker style (set to None to disable markers)
-    marker_size : int
-        Marker size
-    fontweight : str
-        Font weight ('normal', 'bold', etc.)
-    bbox_props : dict or None
-        Properties for text box
-        
-    Returns:
-    --------
-    list : List of added elements
     """
     if not objects:
         return []
@@ -564,28 +472,45 @@ def add_object_labels(ax, objects, fontsize=10, marker=None, marker_size=4,
     label_positions = []
     added_elements = []
     
+    # Sort objects by importance to ensure high priority objects get labeled first
+    sorted_objects = sorted(objects, key=lambda x: (
+        0 if x.get('importance') == 'high' else (1 if x.get('importance') == 'medium' else 2),
+        x.get('mag', 999)
+    ))
+    
     # Add labels and markers
-    for obj in objects:
+    for obj in sorted_objects:
         try:
             x, y = obj['x'], obj['y']
             name = obj['name']
             obj_type = obj.get('type', 'other')
+            importance = obj.get('importance', 'medium')
             
-            # Choose color
+            # Choose color based on object type
             color = colors.get(obj_type, 'white')
+            
+            # Adjust font size based on importance
+            label_size = fontsize
+            if importance == 'high':
+                label_size = fontsize + 2
+            elif importance == 'low':
+                label_size = fontsize - 1
             
             # Add marker if specified
             if marker:
-                m = ax.plot(x, y, marker, color=color, ms=marker_size, mew=1.0, alpha=0.7, zorder=100)[0]
+                # Adjust marker size based on importance
+                ms = marker_size
+                if importance == 'high':
+                    ms = marker_size * 1.5
+                elif importance == 'low':
+                    ms = marker_size * 0.8
+                    
+                m = ax.plot(x, y, marker, color=color, ms=ms, mew=1.0, alpha=0.7, zorder=100)[0]
                 added_elements.append(m)
             
-            # Check for label position overlaps
-            overlap = False
-            label_pos = None
-            
             # Try different positions for the label to avoid overlaps
-            positions = [(10, 10), (-10, 10), (10, -10), (-10, -10), 
-                        (20, 0), (-20, 0), (0, 20), (0, -20)]
+            positions = [(10, 10), (-10, 10), (10, -10), (-10, -10), (20, 0), (-20, 0)]
+            label_pos = None
             
             for dx, dy in positions:
                 new_pos = (x + dx, y + dy)
@@ -603,14 +528,17 @@ def add_object_labels(ax, objects, fontsize=10, marker=None, marker_size=4,
             
             # Use default position if all positions overlap
             if label_pos is None:
-                label_pos = (x + 10, y + 10)
+                if importance == 'high':
+                    label_pos = (x + 10, y + 10)  # Force label for important objects
+                else:
+                    continue  # Skip less important labels if too crowded
             
-            # Add label
+            # Add the label
             t = ax.text(
                 label_pos[0], label_pos[1], 
                 name, 
                 color=color, 
-                fontsize=fontsize, 
+                fontsize=label_size, 
                 fontweight=fontweight,
                 bbox=bbox_props,
                 ha='left', 
